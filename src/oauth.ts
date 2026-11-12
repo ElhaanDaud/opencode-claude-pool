@@ -320,6 +320,8 @@ export function startOAuthCallbackServer(): Promise<OAuthCallbackServer> {
       codeResolve = res;
       codeReject = rej;
     });
+    // A listener may be closed before anyone asks for its result.
+    codePromise.catch(() => undefined);
 
     const escapeHtml = (s: string) =>
       s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
@@ -390,6 +392,7 @@ export function startOAuthCallbackServer(): Promise<OAuthCallbackServer> {
         waitForCode: () => codePromise,
         close: () => {
           clearTimeout(timeout);
+          codeReject?.(new Error("OAuth callback cancelled"));
           server.close();
         },
       });

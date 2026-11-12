@@ -178,11 +178,8 @@ interface PendingEntry {
 
 /**
  * Requests between `http.request` and `http.response`. They are matched by the
- * Request object we handed back (V2 passes the same one to both hooks); if
- * another plugin replaced it after us, the session and request kind (which
- * both events carry) identify it instead, but only while a single request of
- * that kind is outstanding: with concurrent ones, guessing would feed one
- * request's response to another's rotation.
+ * Request object we handed back, or a random URL fragment that survives cloning
+ * without being sent to the server. Never guess based on the session alone.
  */
 class PendingRequests {
   private readonly byKey = new Map<string, PendingEntry[]>();
@@ -190,6 +187,9 @@ class PendingRequests {
   private readonly untracked = new WeakSet<Request>();
 
   add(event: V2HttpRequestEvent, value: Pending): void {
+    const url = new URL(event.request.url);
+    url.hash = `claude-bridge-${randomUUID()}`;
+    event.request = new Request(url, event.request);
     const key = keyOf(event);
     const now = Date.now();
     const live = (this.byKey.get(key) ?? []).filter((entry) => now - entry.at < PENDING_MAX_AGE_MS);
@@ -210,15 +210,8 @@ class PendingRequests {
     const key = keyOf(event);
     const entries = this.byKey.get(key) ?? [];
     const exact = entries.find((entry) => entry.request === event.request);
-    const match = exact ?? (entries.length === 1 ? entries[0] : undefined);
-    if (!match) {
-      if (entries.length > 1) {
-        console.error(
-          "[opencode-claude-bridge] another plugin replaced the request and several are in flight; skipping pool rotation for one response",
-        );
-      }
-      return undefined;
-    }
+    const match = exact ?? entries.find((entry) => entry.request.url === event.request.url);
+    if (!match) return undefined;
     this.remove(key, match);
     return match.value;
   }

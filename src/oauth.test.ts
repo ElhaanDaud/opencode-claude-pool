@@ -105,6 +105,15 @@ describe("token endpoint secret handling", () => {
 });
 
 describe("OAuth state verification", () => {
+  it("rejects a pending authorization when the listener closes", async () => {
+    const server = await startOAuthCallbackServer();
+    const result = Promise.race([
+      server.waitForCode().then(() => "resolved", () => "rejected"),
+      new Promise<string>((resolve) => setTimeout(() => resolve("pending"), 30)),
+    ]);
+    server.close();
+    assert.equal(await result, "rejected");
+  });
   it("reads the state from each pasted form", () => {
     assert.equal(parsePastedState("abc123#st4te"), "st4te");
     assert.equal(parsePastedState("https://x/callback?code=abc&state=st%3Dte"), "st=te");

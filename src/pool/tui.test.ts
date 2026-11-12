@@ -5,6 +5,12 @@ import { LabelConflictError } from "./enroll.js";
 import { clipFrame, createPoolTui, findRedundant } from "./tui.js";
 import type { TuiDeps } from "./tui.js";
 import type { PoolSnapshot, PoolSnapshotRow } from "./manager.js";
+import type { AccountState, RotationState } from "./types.js";
+import { EventEmitter } from "node:events";
+
+function lockedState(rotation: RotationState = { version: 1, activeLabel: null, accounts: {} }) {
+  return { withLock: async <T>(fn: (state: RotationState) => T | Promise<T>) => fn(rotation) };
+}
 
 function row(label: string, status: PoolSnapshotRow["status"]): PoolSnapshotRow {
   return {
@@ -26,6 +32,138 @@ function row(label: string, status: PoolSnapshotRow["status"]): PoolSnapshotRow 
     updatedAt: null,
   };
 }
+
+describe("dashboard regressions", () => {
+  function fixture(options: { rows?: number; snapshot?: TuiDeps["pool"]["snapshot"]; fetchUsage?: TuiDeps["fetchUsage"]; raw?: (enabled: boolean) => void } = {}) {
+    const writes: string[] = [];
+    const stdin = Object.assign(new EventEmitter(), {
+      isTTY: true, setRawMode: options.raw ?? (() => undefined), resume: () => undefined,
+      pause: () => undefined, setEncoding: () => undefined,
+    });
+    const stdout = Object.assign(new EventEmitter(), {
+      isTTY: true, columns: 100, rows: options.rows ?? 24,
+      write: (text: string) => { writes.push(text); return true; },
+    });
+    const removed: string[] = [];
+    const tui = createPoolTui({
+      pool: {
+        snapshot: options.snapshot ?? (async () => ({ activeLabel: null, now: 0, accounts: Array.from({ length: 30 }, (_, i) => row(`account-${i}`, "ready")) })),
+        pendingRefreshLabel: () => "account-0",
+      } as unknown as TuiDeps["pool"],
+      accounts: { getAccount: async () => ({}), removeAccount: async (label: string) => { removed.push(label); } } as unknown as TuiDeps["accounts"],
+      state: lockedState() as unknown as TuiDeps["state"],
+      enroll: async () => "", whoami: async () => "cli@example.com", fetchUsage: options.fetchUsage,
+      stdin: stdin as unknown as NodeJS.ReadStream, stdout: stdout as unknown as NodeJS.WriteStream,
+    });
+    return { tui, stdin, stdout, writes, removed };
+  }
+  const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+  it("keeps a crowded removal confirmation visible within the terminal", async () => {
+    const ui = fixture({ snapshot: async () => ({ activeLabel: null, now: 0, accounts: Array.from({ length: 30 }, (_, i) => ({ ...row(`account-${i}`, "ready"), reason: "detail", scopes: ["scope"] })) }) });
+    const started = ui.tui.start();
+    await tick();
+    await ui.tui.onKey("\r");
+    await ui.tui.onKey("x");
+    const frame = ui.writes.at(-1) ?? "";
+    ui.tui.stop();
+    await started;
+    assert.match(frame, /Remove "account-0"/);
+    assert.ok(frame.split("\n").length - 1 <= 24);
+  });
+
+  it("does not accept a confirmation that cannot fit on screen", async () => {
+    const ui = fixture({ rows: 3 });
+    const started = ui.tui.start();
+    await tick();
+    await ui.tui.onKey("x");
+    await ui.tui.onKey("y");
+    ui.tui.stop();
+    await started;
+    assert.deepEqual(ui.removed, []);
+  });
+
+  it("restores the terminal when raw mode setup fails", async () => {
+    const raw: boolean[] = [];
+    const ui = fixture({ raw: (enabled) => { raw.push(enabled); if (enabled) throw new Error("raw failed"); } });
+    await assert.rejects(ui.tui.start(), /raw failed/);
+    assert.deepEqual(raw, [true, false]);
+    assert.match(ui.writes.join(""), /\u001b\[\?25h\u001b\[\?1049l/);
+  });
+
+  it("cleans up when the first snapshot fails", async () => {
+    const ui = fixture({ snapshot: async () => { throw new Error("snapshot failed"); } });
+    await assert.rejects(ui.tui.start(), /snapshot failed/);
+    assert.match(ui.writes.join(""), /\u001b\[\?25h\u001b\[\?1049l/);
+  });
+
+  it("surfaces periodic reload errors", async (t) => {
+    t.mock.timers.enable({ apis: ["setInterval"] });
+    let calls = 0;
+    const ui = fixture({ snapshot: async () => {
+      if (calls++) throw new Error("reload failed");
+      return { activeLabel: null, now: 0, accounts: [row("a", "ready")] };
+    } });
+    const started = ui.tui.start();
+    await tick();
+    t.mock.timers.tick(30_000);
+    await tick();
+    const frame = ui.writes.at(-1) ?? "";
+    ui.tui.stop();
+    await started;
+    assert.match(frame, /reload failed/);
+  });
+
+  it("does not let an older detail request overwrite a newer usage refresh", async () => {
+    const resolvers: Array<(value: import("./usage.js").AccountUsage) => void> = [];
+    const ui = fixture({
+      snapshot: async () => ({ activeLabel: null, now: 0, accounts: [{ ...row("a", "ready"), tokenExpires: Date.now() + 3600000 }] }),
+      fetchUsage: () => new Promise((resolve) => { resolvers.push(resolve); }),
+    });
+    const started = ui.tui.start();
+    await tick();
+    const older = ui.tui.onKey("\r");
+    const newer = ui.tui.onKey("s");
+    const value = (utilization: number) => ({ fiveHour: { utilization, resetsAt: null, lockedReason: null }, sevenDay: null, sevenDayOpus: null, fetchedAt: 0 });
+    resolvers[1]!(value(80));
+    await newer;
+    resolvers[0]!(value(10));
+    await older;
+    const frame = ui.writes.at(-1) ?? "";
+    ui.tui.stop();
+    await started;
+    assert.match(frame, /80%/);
+  });
+
+  it("reports a rejected usage fetch as failure", async () => {
+    const ui = fixture({ fetchUsage: async () => { throw new Error("network down"); } });
+    const started = ui.tui.start();
+    await tick();
+    await ui.tui.onKey("s");
+    const frame = ui.writes.at(-1) ?? "";
+    ui.tui.stop();
+    await started;
+    assert.match(frame, /usage failed/);
+  });
+
+  it("forces manual refresh using the stored access token", async () => {
+    let rejected: string | undefined;
+    const tui = createPoolTui({
+      pool: {
+        snapshot: async () => ({ activeLabel: null, now: 0, accounts: [row("a", "ready")] }),
+        pendingRefreshLabel: () => null,
+        refreshLabel: async (_label: string, access?: string) => { rejected = access; return { expires: Date.now() + 3600000 }; },
+      } as unknown as TuiDeps["pool"],
+      accounts: { getAccount: async () => ({ oauth: { access: "fresh-access", expires: Date.now() + 3600000 } }) } as unknown as TuiDeps["accounts"],
+      state: {} as TuiDeps["state"], enroll: async () => "",
+      stdout: { columns: 100, rows: 30, write: () => true, on: () => undefined } as unknown as NodeJS.WriteStream,
+      stdin: {} as NodeJS.ReadStream,
+    });
+    await tui.reload();
+    await tui.onKey("f");
+    assert.equal(rejected, "fresh-access");
+  });
+});
 
 describe("pool TUI selection", () => {
   it("keeps the selection on the same account when a reload re-sorts the rows", async () => {
@@ -63,21 +201,19 @@ describe("pool TUI selection", () => {
 
   it("removing an account also drops its rotation state", async () => {
     const calls: string[] = [];
+    const rotation: RotationState = { version: 1, activeLabel: "a", accounts: { a: {} as AccountState } };
     const tui = createPoolTui({
       pool: {
         snapshot: async () => ({ activeLabel: null, now: 0, accounts: [row("a", "disabled")] }),
         pendingRefreshLabel: () => null,
       } as unknown as TuiDeps["pool"],
       accounts: {
+        getAccount: async () => ({}),
         removeAccount: async (label: string) => {
           calls.push(`keychain:${label}`);
         },
       } as unknown as TuiDeps["accounts"],
-      state: {
-        forget: async (label: string) => {
-          calls.push(`state:${label}`);
-        },
-      } as unknown as TuiDeps["state"],
+      state: lockedState(rotation) as unknown as TuiDeps["state"],
       enroll: async () => "",
       stdout: { columns: 100, rows: 30, write: () => true, on: () => undefined } as unknown as NodeJS.WriteStream,
       stdin: {} as NodeJS.ReadStream,
@@ -87,7 +223,41 @@ describe("pool TUI selection", () => {
     await tui.onKey("x");
     await tui.onKey("y");
 
-    assert.deepEqual(calls, ["keychain:a", "state:a"]);
+    assert.deepEqual(calls, ["keychain:a"]);
+    assert.equal(Object.hasOwn(rotation.accounts, "a"), false);
+    assert.equal(rotation.activeLabel, null);
+  });
+
+  it("disables the selected account by hand, and u re-enables it", async () => {
+    let status: PoolSnapshotRow["status"] = "ready";
+    const calls: string[] = [];
+    const tui = createPoolTui({
+      pool: {
+        snapshot: async () => ({ activeLabel: null, now: 0, accounts: [row("a", status)] }),
+        pendingRefreshLabel: () => null,
+      } as unknown as TuiDeps["pool"],
+      accounts: {} as TuiDeps["accounts"],
+      state: {
+        markDisabled: async (label: string, reason: string) => {
+          calls.push(`disable:${label}:${reason}`);
+          status = "disabled";
+        },
+        resetHealth: async (label: string) => {
+          calls.push(`enable:${label}`);
+          status = "ready";
+        },
+      } as unknown as TuiDeps["state"],
+      enroll: async () => "",
+      stdout: { columns: 100, rows: 30, write: () => true, on: () => undefined } as unknown as NodeJS.WriteStream,
+      stdin: {} as NodeJS.ReadStream,
+    });
+
+    await tui.reload();
+    await tui.onKey("d");
+    await tui.onKey("d");
+    await tui.onKey("u");
+
+    assert.deepEqual(calls, ["disable:a:disabled by hand", "enable:a"]);
   });
 });
 
@@ -118,11 +288,12 @@ describe("pool TUI prune", () => {
         pendingRefreshLabel: () => null,
       } as unknown as TuiDeps["pool"],
       accounts: {
+        getAccount: async () => ({}),
         removeAccount: async (label: string) => {
           removed.push(label);
         },
       } as unknown as TuiDeps["accounts"],
-      state: { forget: async () => undefined } as unknown as TuiDeps["state"],
+      state: lockedState() as unknown as TuiDeps["state"],
       enroll: async () => "",
       stdout: { columns: 100, rows: 30, write: () => true, on: () => undefined } as unknown as NodeJS.WriteStream,
       stdin: {} as NodeJS.ReadStream,
@@ -190,11 +361,12 @@ describe("pool TUI enroll", () => {
         pendingRefreshLabel: () => null,
       } as unknown as TuiDeps["pool"],
       accounts: {
+        getAccount: async () => ({}),
         removeAccount: async (label: string) => {
           removed.push(label);
         },
       } as unknown as TuiDeps["accounts"],
-      state: { forget: async () => {} } as unknown as TuiDeps["state"],
+      state: lockedState() as unknown as TuiDeps["state"],
       enroll: () =>
         new Promise((resolve) => {
           finishEnroll = resolve;
@@ -417,7 +589,7 @@ describe("pool TUI signals", () => {
             finish = () => resolve({ access: "new", refresh: "rotated", expires: Date.now() + 3_600_000 });
           }),
       } as unknown as TuiDeps["pool"],
-      accounts: {} as TuiDeps["accounts"],
+      accounts: { getAccount: async () => ({ oauth: { access: "old" } }) } as unknown as TuiDeps["accounts"],
       state: {} as TuiDeps["state"],
       enroll: async () => "",
       stdin: stdin as unknown as NodeJS.ReadStream,

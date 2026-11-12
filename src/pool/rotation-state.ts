@@ -232,12 +232,16 @@ export function createRotationStateStore(opts: RotationStateStoreOptions) {
     try {
       // "wx" fails if the file exists — atomic on POSIX, no dependency needed.
       fd = fs.openSync(lockPath, "wx", 0o600);
-    } catch {
-      return null;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "EEXIST") return null;
+      throw err;
     }
     try {
       fs.writeSync(fd, JSON.stringify(payload));
       fs.fsyncSync(fd);
+    } catch (err) {
+      try { fs.rmSync(lockPath, { force: true }); } catch { /* best effort */ }
+      throw err;
     } finally {
       try { fs.closeSync(fd); } catch { /* best effort */ }
     }
@@ -280,7 +284,7 @@ export function createRotationStateStore(opts: RotationStateStoreOptions) {
     }
   }
 
-  function tryReclaimStale(observed: Buffer): boolean {
+  function tryReclaimStale(observed: Buffer, identity?: fs.Stats): boolean {
     const claim = reclaimPath(observed);
     try {
       fs.closeSync(fs.openSync(claim, "wx", 0o600));
@@ -290,6 +294,10 @@ export function createRotationStateStore(opts: RotationStateStoreOptions) {
     try {
       // Any mismatch means it was already reclaimed and replaced.
       if (!fs.readFileSync(lockPath).equals(observed)) return false;
+      if (identity) {
+        const current = fs.statSync(lockPath);
+        if (current.dev !== identity.dev || current.ino !== identity.ino || clock() - current.mtimeMs <= staleLockMs) return false;
+      }
       fs.rmSync(lockPath);
       return true;
     } catch {
@@ -316,15 +324,10 @@ export function createRotationStateStore(opts: RotationStateStoreOptions) {
       // evict a holder that is mid-acquisition. Only discard it once it is old
       // enough that no in-progress acquisition could still be responsible.
       if (!raw || !existing) {
-        let age = Infinity;
         try {
-          age = clock() - fs.statSync(lockPath).mtimeMs;
-        } catch {
-          continue;
-        }
-        if (age > staleLockMs) {
-          try { fs.rmSync(lockPath, { force: true }); } catch { /* best effort */ }
-        }
+          const identity = fs.statSync(lockPath);
+          if (raw && clock() - identity.mtimeMs > staleLockMs) tryReclaimStale(raw, identity);
+        } catch { /* The lock may have disappeared; the deadline still applies. */ }
       } else if (clock() - existing.acquiredAt > staleLockMs && holderIsGone(existing)) {
         if (tryReclaimStale(raw)) {
           const reclaimed = tryCreateLock();
@@ -387,7 +390,7 @@ export function createRotationStateStore(opts: RotationStateStoreOptions) {
   ): Promise<void> {
     await withLock((state) => {
       const now = clock();
-      if (!state.accounts[label]) state.accounts[label] = defaultAccountState(now);
+      if (!Object.hasOwn(state.accounts, label)) Object.defineProperty(state.accounts, label, { value: defaultAccountState(now), writable: true, enumerable: true, configurable: true });
       mutate(state.accounts[label]!, now);
     });
   }
@@ -407,10 +410,10 @@ export function createRotationStateStore(opts: RotationStateStoreOptions) {
       // Fast path: this runs for every account on every acquire(), and taking
       // the cross-process lock to discover "already present" cost ~10ms each.
       // Re-checked under the lock below, so the race is benign.
-      if (load().accounts[label]) return;
+      if (Object.hasOwn(load().accounts, label)) return;
       await withLock((state) => {
-        if (!state.accounts[label]) {
-          state.accounts[label] = defaultAccountState(clock());
+        if (!Object.hasOwn(state.accounts, label)) {
+          Object.defineProperty(state.accounts, label, { value: defaultAccountState(clock()), writable: true, enumerable: true, configurable: true });
         }
       });
     },
@@ -470,7 +473,7 @@ export function createRotationStateStore(opts: RotationStateStoreOptions) {
       await mutateAccount(label, (account, now) => {
         // Anything recorded since the request went out (e.g. a concurrent
         // request's 429) is newer news than this success, so it stands.
-        if (account.updatedAt > sentAt) return;
+        if (account.updatedAt >= sentAt) return;
         account.cooldownUntil = null;
         account.failureCount = 0;
         account.updatedAt = now;

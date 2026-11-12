@@ -38,7 +38,9 @@ export function selectClaudeCredentials(
   candidates: Array<KeychainCredentials | null>,
 ): KeychainCredentials | null {
   for (const candidate of candidates) {
-    if (candidate?.claudeAiOauth) return candidate;
+    const oauth = candidate?.claudeAiOauth;
+    if (oauth && typeof oauth.accessToken === "string" && typeof oauth.refreshToken === "string" &&
+        typeof oauth.expiresAt === "number" && Number.isFinite(oauth.expiresAt)) return candidate;
   }
   return null;
 }
@@ -57,7 +59,7 @@ function readKeychainItem(account?: string): KeychainCredentials | null {
       stdio: ["ignore", "pipe", "ignore"],
     }).trim();
     if (!raw) return null;
-    return JSON.parse(raw) as KeychainCredentials;
+    return selectClaudeCredentials([JSON.parse(raw) as KeychainCredentials]);
   } catch {
     // Item missing, Keychain unavailable, or unparseable contents.
     return null;
@@ -94,7 +96,7 @@ export function readClaudeCredentials(): KeychainCredentials | null {
   // Fallback: credentials file
   try {
     const raw = readFileSync(claudeCredentialsPath(), "utf8");
-    return JSON.parse(raw) as KeychainCredentials;
+    return selectClaudeCredentials([JSON.parse(raw) as KeychainCredentials]);
   } catch {
     return null;
   }

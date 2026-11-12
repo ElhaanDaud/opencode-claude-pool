@@ -390,13 +390,14 @@ export function getClaudeToolsForActiveOpenCodeTools(
   const claudeToolsByName = new Map(getClaudeTools().map((tool) => [tool.name, tool]));
   const selectedToolsByName = new Map<string, ToolDefinition>();
   const coreNames = new Set<string>();
+  const names = new Set(tools.map(getToolName));
 
   for (const tool of tools) {
     const name = getToolName(tool);
     if (!name) continue;
 
     const claudeName = ACTIVE_TOOL_SCHEMA_NAME_MAP[name];
-    if (claudeName) {
+    if (claudeName && !names.has(claudeName)) {
       const claudeTool = claudeToolsByName.get(claudeName);
       if (!claudeTool) continue;
       const def = claudeName === "Agent"
@@ -438,12 +439,13 @@ export function getInboundToolNameMapForActiveOpenCodeTools(
 ): Record<string, string> {
   if (!Array.isArray(tools)) return {};
   const inboundToolNameMap: Record<string, string> = {};
+  const names = new Set(tools.map(getToolName));
 
   for (const tool of tools) {
     const name = getToolName(tool);
     if (!name) continue;
     const claudeName = ACTIVE_TOOL_SCHEMA_NAME_MAP[name];
-    if (claudeName) inboundToolNameMap[claudeName] = name;
+    if (claudeName && !names.has(claudeName)) inboundToolNameMap[claudeName] = name;
   }
 
   return inboundToolNameMap;
@@ -982,8 +984,8 @@ export async function prepareRequest(
   const { sessionId, deviceId } = opts;
   // ── Headers ──
   const headers = new Headers();
-  if (input instanceof Request) mergeHeaders(headers, input.headers);
   if (init?.headers) mergeHeaders(headers, init.headers);
+  else if (input instanceof Request) mergeHeaders(headers, input.headers);
 
   headers.set("authorization", `Bearer ${accessToken}`);
   headers.delete("x-api-key");
@@ -1004,7 +1006,10 @@ export async function prepareRequest(
   const userIdFor = (token: string) => buildUserId(token, deviceId, sessionId);
   let ownsUserId = false;
 
-  let body = init?.body;
+  let body = init?.body !== undefined ? init.body
+    : input instanceof Request && input.body ? await input.clone().text() : undefined;
+  // Replaced by the active tools' map below; with no tools array there is no
+  // custom tool to collide with, so every built-in keeps its Claude name.
   let inboundToolNameMap = INBOUND_TOOL_NAME_MAP;
   if (body && typeof body === "string") {
     try {
@@ -1130,7 +1135,10 @@ export async function prepareRequest(
           inboundToolNameMap = getInboundToolNameMapForActiveOpenCodeTools(parsed.tools);
           parsed.tools = getClaudeToolsForActiveOpenCodeTools(parsed.tools);
           if (parsed.tool_choice?.type === "tool") {
-            parsed.tool_choice = { ...parsed.tool_choice, name: mapOutboundToolName(parsed.tool_choice.name) };
+            const wireName = mapOutboundToolName(parsed.tool_choice.name);
+            if (wireName && inboundToolNameMap[wireName] === parsed.tool_choice.name) {
+              parsed.tool_choice = { ...parsed.tool_choice, name: wireName };
+            }
           }
         }
       }
@@ -1143,7 +1151,9 @@ export async function prepareRequest(
           if (!Array.isArray(msg.content)) continue;
           for (const block of msg.content) {
             if (opts.claudeTools && block.type === "tool_use" && block.name) {
-              block.name = mapOutboundToolName(block.name);
+              const wireName = mapOutboundToolName(block.name);
+              if (!wireName || inboundToolNameMap[wireName] !== block.name) continue;
+              block.name = wireName;
               // Consolidated OpenCode → Claude argument translation:
               // key renames, Agent/AskUserQuestion/Skill/WebFetch/TodoWrite
               // field bridging. Mirrors translateToolArgsJsonString
@@ -1309,15 +1319,6 @@ export async function settlePoolResponse(input: SettleInput): Promise<Response> 
       }
 
       // ROTATE_COOLDOWN / ROTATE_DISABLE
-      const signature = failureSignature(response.status, bodyText);
-      const repeated = unconfirmed.find((u) => u.signature === signature);
-      if (repeated) {
-        console.error(
-          `[claude-pool] "${repeated.label}" and "${activeLabel}" failed identically (HTTP ${response.status}); the request is at fault, not the accounts — passing the error through without penalising either`,
-        );
-        return rebuild();
-      }
-
       // A 401 may mean only the access token was revoked while its
       // refresh token still works: refresh once through the pool's
       // locked, journaled path and resend before blaming the account.
@@ -1342,6 +1343,14 @@ export async function settlePoolResponse(input: SettleInput): Promise<Response> 
           }
           continue;
         }
+      }
+      const signature = failureSignature(response.status, bodyText);
+      const repeated = unconfirmed.find((u) => u.signature === signature);
+      if (repeated) {
+        console.error(
+          `[claude-pool] "${repeated.label}" and "${activeLabel}" failed identically (HTTP ${response.status}); the request is at fault, not the accounts — passing the error through without penalising either`,
+        );
+        return rebuild();
       }
       tried.add(activeLabel);
 
@@ -1446,6 +1455,7 @@ export async function startPool(client: PoolClient, toast: Toaster): Promise<Sta
       const adopted = await autoEnrollIfNew({
         accounts: createAccountStore(createSecretBackend()),
         isDisabled: (label) => rotation.load().accounts[label]?.disabled === true,
+        lock: (fn) => rotation.withLock(() => fn()),
       });
       if (adopted.status === "enrolled") {
         console.error(
@@ -1680,7 +1690,10 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
             const prepared = await prepareRequest(input, init, accessToken, {
               sessionId, deviceId, claudeTools: true, ensureClaudePrefix: false,
             });
-            const { finalUrl, outHeaders, body, inboundToolNameMap } = prepared;
+            const { finalUrl, outHeaders, inboundToolNameMap } = prepared;
+            let { body } = prepared;
+            const method = init?.method ?? (input instanceof Request ? input.method : "POST");
+            const signal = init?.signal !== undefined ? init.signal : input instanceof Request ? input.signal : undefined;
 
             // Send time of the latest attempt, so its success can't undo a
             // penalty recorded while it was in flight.
@@ -1688,10 +1701,10 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
             const doFetch = () => {
               sentAt = Date.now();
               return fetchUpstream(finalUrl, {
-                method: init?.method || "POST",
+                method,
                 body,
                 headers: outHeaders,
-                signal: init?.signal,
+                signal,
               });
             };
 
@@ -1702,9 +1715,9 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                 pool, toast, response, activeLabel, outHeaders, body,
                 ownsUserId: prepared.ownsUserId,
                 send: (headers, sendBody) => fetchUpstream(finalUrl, {
-                  method: init?.method || "POST", body: sendBody, headers, signal: init?.signal,
+                  method, body: sendBody, headers, signal,
                 }),
-                signal: init?.signal, sessionId, deviceId, sentAt,
+                signal, sessionId, deviceId, sentAt,
               });
             }
 
@@ -1723,6 +1736,13 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
               if (freshToken && freshToken !== accessToken) {
                 await response.body?.cancel();
                 outHeaders["authorization"] = `Bearer ${freshToken}`;
+                if (prepared.ownsUserId && typeof body === "string") {
+                  const rebound = JSON.parse(body);
+                  const userId = await buildUserId(freshToken, deviceId, sessionId);
+                  if (userId) rebound.metadata.user_id = userId;
+                  else delete rebound.metadata.user_id;
+                  body = JSON.stringify(rebound);
+                }
                 response = await doFetch();
               }
             }
@@ -1761,7 +1781,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                 console.error(`[opencode-claude-bridge] ${response.status} overloaded (${attempt}), retrying in ${Math.ceil(delayMs / 1000)}s`);
               }
               await response.body?.cancel();
-              await abortableSleep(delayMs, init?.signal);
+              await abortableSleep(delayMs, signal);
               response = await doFetch();
             }
 
@@ -1774,7 +1794,8 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
             return new Response(
               translateSseStream(response.body, {
                 inboundToolNameMap,
-                translateToolArgs: translateToolArgsJsonString,
+                translateToolArgs: (json, name) => inboundToolNameMap[name]
+                  ? translateToolArgsJsonString(json, name) : json,
                 debug: (msg) => console.error(`[opencode-claude-bridge] stream: ${msg}`),
               }),
               { status: response.status, statusText: response.statusText, headers: response.headers },

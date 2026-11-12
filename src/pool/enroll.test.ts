@@ -154,6 +154,33 @@ describe("label handling for arbitrary accounts", () => {
 });
 
 describe("duplicate enrollment", () => {
+  it("does not copy an email to an unrelated replacement with unknown identity", async () => {
+    const accounts = createAccountStore(memoryBackend());
+    const old = toAccountRecord("alice", parseClaudeCredentials(VALID_CLI_JSON), NOW, "alice@example.com");
+    old.oauth.refresh = "different-token";
+    await accounts.putAccount(old);
+    await enrollFromClaudeCli({ accounts, label: "alice", replace: true, readCredentials: () => VALID_CLI_JSON, resolveEmail: false });
+    assert.equal((await accounts.getAccount("alice"))?.email, undefined);
+  });
+
+  it("returns unavailable when auto enrollment cannot acquire its lock", async () => {
+    const accounts = createAccountStore(memoryBackend());
+    const old = toAccountRecord("old", parseClaudeCredentials(VALID_CLI_JSON), NOW);
+    old.oauth.refresh = "other-token";
+    await accounts.putAccount(old);
+    const result = await autoEnrollIfNew({
+      accounts, clock: () => NOW, readCredentials: () => VALID_CLI_JSON,
+      resolveEmail: async () => "alice@example.com",
+      lock: async () => { throw new Error("lock timeout"); },
+    });
+    assert.equal(result.status, "unavailable");
+  });
+  it("preserves a known email when re-enrolling the same token without profile access", async () => {
+    const accounts = createAccountStore(memoryBackend());
+    await accounts.putAccount(toAccountRecord("alice", parseClaudeCredentials(VALID_CLI_JSON), NOW, "alice@example.com"));
+    await enrollFromClaudeCli({ accounts, label: "alice", readCredentials: () => VALID_CLI_JSON, resolveEmail: false });
+    assert.equal((await accounts.getAccount("alice"))?.email, "alice@example.com");
+  });
   it("refuses to enroll the same account under a second label", async () => {
     const store = createAccountStore(memoryBackend());
     await store.putAccount(

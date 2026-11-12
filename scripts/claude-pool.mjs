@@ -62,7 +62,7 @@ const { createRotationStateStore, defaultLockPath, defaultStatePath } = await im
 const { createAccountStore, createSecretBackend } = await import("../dist/pool/secret-store.js");
 const {
   enrollFromClaudeCli, EnrollmentError, readClaudeCliCredentialsRaw, parseClaudeCredentials, lookupEmail, autoEnrollIfNew,
-  labelSharingClaudeCliLogin, sharedLoginWarning, findByEmail,
+  labelSharingClaudeCliLogin, sharedLoginWarning, findByEmail, removeEnrolledAccount,
 } = await import("../dist/pool/enroll.js");
 const { selectNext } = await import("../dist/pool/selection.js");
 
@@ -96,6 +96,7 @@ function when(ts) {
 async function enroll(label, flags = []) {
   const record = await enrollFromClaudeCli({
     accounts,
+    lock: (fn) => state.withLock(() => fn()),
     label,
     replace: flags.includes("--replace"),
   });
@@ -119,6 +120,7 @@ async function enroll(label, flags = []) {
 async function auto() {
   const result = await autoEnrollIfNew({
     accounts,
+    lock: (fn) => state.withLock(() => fn()),
     isDisabled: (label) => state.load().accounts[label]?.disabled === true,
   });
   switch (result.status) {
@@ -223,15 +225,11 @@ async function status() {
 
 async function remove(label) {
   if (!label) throw new Error("usage: claude-pool remove <label>");
-  const inKeychain = (await accounts.getAccount(label)) !== null;
-  const inState = Object.hasOwn(state.load().accounts, label);
-  if (!inKeychain && !inState) {
+  if (!await removeEnrolledAccount(accounts, state, label)) {
     const known = (await accounts.listAccounts()).map((a) => a.label);
     console.error(`No account named "${label}". Enrolled: ${known.join(", ") || "none"}`);
     process.exit(1);
   }
-  await accounts.removeAccount(label);
-  await state.forget(label);
   console.log(`Removed "${label}".`);
 }
 
@@ -277,6 +275,7 @@ async function dashboard() {
     enroll: async (label, options) => {
       const record = await enrollFromClaudeCli({
         accounts,
+        lock: (fn) => state.withLock(() => fn()),
         label,
         resolveEmail: true,
         replace: options?.replace === true,

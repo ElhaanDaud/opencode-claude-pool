@@ -8,6 +8,7 @@ import type { TestContext } from "node:test";
 import { createRotationManager, describeExhaustion, formatWait } from "./manager.js";
 import { createRotationStateStore } from "./rotation-state.js";
 import { createAccountStore } from "./secret-store.js";
+import { enrollFromClaudeCli } from "./enroll.js";
 import type {
   AccountRecord,
   PoolOAuthTokens,
@@ -129,6 +130,56 @@ function harness(
 }
 
 describe("rotation manager activation", () => {
+  it("cools rather than disables when quarantine failure contains an OAuth error word", async (t) => {
+    const h = harness(t, [record("alice", { expires: NOW - 1 })]);
+    fs.writeFileSync(h.journalPath, JSON.stringify({ label: "removed", tokens: { access: "a", refresh: "r", expires: NOW }, writtenAt: NOW }));
+    const rename = fs.renameSync;
+    t.mock.method(fs, "renameSync", (oldPath: fs.PathLike, newPath: fs.PathLike) => {
+      if (String(oldPath) === h.journalPath) throw new Error("invalid_grant");
+      return rename(oldPath, newPath);
+    });
+    await h.manager.acquire();
+    assert.equal(h.state.load().accounts.alice?.disabled, false);
+    assert.equal(h.state.load().accounts.alice?.cooldownUntil, NOW + 60000);
+    assert.deepEqual(h.refreshCalls, []);
+  });
+  it("serializes replacement enrollment behind an in-flight refresh", async (t) => {
+    const h = harness(t, [record("alice", { expires: NOW - 1 })]);
+    let started!: () => void;
+    const entered = new Promise<void>((resolve) => { started = resolve; });
+    let finish!: (tokens: PoolOAuthTokens) => void;
+    const pending = new Promise<PoolOAuthTokens>((resolve) => { finish = resolve; });
+    const manager = createRotationManager({
+      accounts: h.accounts, state: h.state, journalPath: h.journalPath,
+      clock: () => NOW, mirrorFn: async () => {},
+      refreshFn: () => { started(); return pending; },
+    });
+    const refreshing = manager.refreshLabel("alice");
+    await entered;
+    const options = {
+      accounts: h.accounts, label: "alice", replace: true, resolveEmail: false as const,
+      readCredentials: () => JSON.stringify({ claudeAiOauth: { accessToken: "new-access", refreshToken: "new-refresh", expiresAt: NOW + 9000000 } }),
+      lock: <T>(fn: () => Promise<T>) => h.state.withLock(() => fn()),
+    };
+    const enrolling = enrollFromClaudeCli(options);
+    await new Promise((resolve) => setImmediate(resolve));
+    finish({ access: "old-result", refresh: "old-result", expires: NOW + 3600000 });
+    await Promise.all([refreshing, enrolling]);
+    assert.equal((await h.accounts.getAccount("alice"))?.oauth.refresh, "new-refresh");
+  });
+  it("does not refresh when a stale journal cannot be quarantined", async (t) => {
+    const h = harness(t, [record("alice", { expires: NOW - 1 })]);
+    const journal = JSON.stringify({ label: "removed", tokens: { access: "a", refresh: "r", expires: NOW }, writtenAt: NOW });
+    fs.writeFileSync(h.journalPath, journal);
+    const rename = fs.renameSync;
+    t.mock.method(fs, "renameSync", (oldPath: fs.PathLike, newPath: fs.PathLike) => {
+      if (String(oldPath) === h.journalPath) throw new Error("quarantine failed");
+      return rename(oldPath, newPath);
+    });
+    await assert.rejects(h.manager.refreshLabel("alice"), /quarantine failed/);
+    assert.deepEqual(h.refreshCalls, []);
+    assert.equal(fs.readFileSync(h.journalPath, "utf8"), journal);
+  });
   it("stays inactive until an account is enrolled", async (t) => {
     const empty = harness(t, []);
     assert.equal(await empty.manager.isActive(), false);
@@ -246,7 +297,8 @@ describe("rotation manager token acquisition", () => {
     assert.deepEqual(mirrored(), ["access-alice", "access-bob"]);
 
     // Back to alice with the same tokens: auth.json now holds bob's.
-    await h.manager.markSuccess("alice", NOW);
+    h.setNow(NOW + 1);
+    await h.manager.markSuccess("alice", NOW + 1);
     await cool("bob");
     await h.manager.acquire();
     assert.deepEqual(mirrored(), ["access-alice", "access-bob", "access-alice"]);
@@ -686,7 +738,8 @@ describe("rotation manager rotation", () => {
       source: "retry-after",
     });
 
-    await h.manager.markSuccess("alice", NOW);
+    h.setNow(NOW + 1);
+    await h.manager.markSuccess("alice", NOW + 1);
 
     assert.equal(h.state.load().accounts.alice?.cooldownUntil, null);
     assert.equal(h.state.load().accounts.alice?.failureCount, 0);

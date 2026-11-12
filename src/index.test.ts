@@ -614,6 +614,15 @@ describe("tool schema selection", () => {
     assert.deepEqual(out, [customTool]);
   });
 
+  it("keeps built-in and custom colliding tools distinct in either order", () => {
+    const builtin = { name: "read", description: "builtin", input_schema: { type: "object", properties: { filePath: { type: "string" } } } };
+    const custom = { name: "Read", description: "custom", input_schema: { type: "object", properties: { pages: { type: "string" } } } };
+    for (const tools of [[builtin, custom], [custom, builtin]]) {
+      assert.deepEqual(getClaudeToolsForActiveOpenCodeTools(tools).sort((a, b) => a.name.localeCompare(b.name)), [builtin, custom].sort((a, b) => a.name.localeCompare(b.name)));
+      assert.deepEqual(getInboundToolNameMapForActiveOpenCodeTools(tools), {});
+    }
+  });
+
   it("maps inbound Claude core names only for active OpenCode core tools", () => {
     assert.deepEqual(getInboundToolNameMapForActiveOpenCodeTools([
       { name: "bash" },
@@ -947,7 +956,7 @@ describe("translateArgsOpencodeToClaude", () => {
     assert.equal(translateArgsOpencodeToClaude("Agent", { subagent_type: "plan" }).subagent_type, "Plan");
   });
 
-  it("strips Agent OpenCode-only fields (task_id, command)", () => {
+  it("preserves Agent continuation fields in history", () => {
     const out = translateArgsOpencodeToClaude("Agent", {
       description: "d",
       prompt: "p",
@@ -959,6 +968,8 @@ describe("translateArgsOpencodeToClaude", () => {
       description: "d",
       prompt: "p",
       subagent_type: "general-purpose",
+      task_id: "t_1",
+      command: "go",
     });
   });
 

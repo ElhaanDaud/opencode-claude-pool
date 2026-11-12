@@ -181,9 +181,18 @@ describe("pool rotation: 401/403 penalties need another account to succeed", () 
     const { status } = await sendWith({ alice: OAUTH_UNSUPPORTED, bob: OAUTH_UNSUPPORTED });
 
     assert.equal(status, 401);
-    // The identical failure is caught before bob's refresh token is spent.
-    assert.deepEqual(refreshCalls, ["refresh-alice"]);
+    assert.deepEqual(refreshCalls, ["refresh-alice", "refresh-bob"]);
     assert.equal(accountState("alice")?.disabled, false);
+    assert.equal(accountState("bob")?.disabled, false);
+  });
+
+  it("refreshes the second account before comparing identical 401s", async () => {
+    renewTokens = true;
+    const { status, tried } = await sendWith({ alice: OAUTH_UNSUPPORTED, "alice-renewed": OAUTH_UNSUPPORTED, bob: OAUTH_UNSUPPORTED, "bob-renewed": OK });
+    assert.equal(status, 200);
+    assert.deepEqual(tried, ["alice", "alice-renewed", "bob", "bob-renewed"]);
+    assert.deepEqual(refreshCalls, ["refresh-alice", "refresh-bob"]);
+    assert.equal(accountState("alice")?.disabled, true);
     assert.equal(accountState("bob")?.disabled, false);
   });
 });

@@ -509,9 +509,8 @@ describe("Claude Pro / Max (OAuth) method", () => {
     const { method, cleanup } = await load();
     const auth = await method.authorize({});
     const redirect = new URL(auth.url).searchParams.get("redirect_uri")!;
-    (auth.callback as Promise<unknown>).catch(() => undefined);
-
     cleanup();
+    await assert.rejects(auth.callback as Promise<unknown>, /cancelled/);
     await assert.rejects(realFetch(redirect));
   });
 
@@ -905,6 +904,23 @@ describe("request/response correlation", () => {
   const cloneRequest = (request: Request) =>
     new Request(request.url, { method: request.method, headers: request.headers, body: request.body, duplex: "half" } as RequestInit);
 
+  it("does not assign a synthetic response to a cloned pass-through request", async () => {
+    await enroll(["alice"]);
+    await coolAll(["alice"]);
+    const loaded = await load();
+    const base = { sessionID: "ses_1", kind: "primary", model: { providerID: "anthropic" } };
+    const pending = { ...base, request: new Request("https://api.anthropic.com/v1/messages", { method: "POST", body: "{}" }) };
+    await loaded.hooks.request!(pending);
+    const passthrough = { ...base, request: new Request("https://api.anthropic.com/v1/messages", { headers: { "x-api-key": "user" } }) };
+    await loaded.hooks.request!(passthrough);
+    const after = { ...base, request: cloneRequest(passthrough.request), response: new Response("ok") };
+    await loaded.hooks.response!(after);
+    assert.equal(after.response.status, 200);
+    const own = { ...base, request: cloneRequest(pending.request), response: new Response("inert") };
+    await loaded.hooks.response!(own);
+    assert.equal(own.response.status, 429);
+  });
+
   it("still rotates when another plugin replaced the request after ours", async () => {
     await enroll(["alice", "bob"]);
     const { response, sent } = await send({
@@ -919,7 +935,7 @@ describe("request/response correlation", () => {
     );
   });
 
-  it("still swaps in the pool's answer when the inert request was replaced", async () => {
+  it("does not match an unrelated replacement for an inert request", async () => {
     await enroll(["alice"]);
     await coolAll(["alice"]);
     const loaded = await load({ replies: { alice: OK } });
@@ -940,10 +956,10 @@ describe("request/response correlation", () => {
     };
     await loaded.hooks.response!(after);
 
-    assert.equal(after.response.status, 429);
+    assert.equal(after.response.status, 200);
   });
 
-  it("does not guess between concurrent requests of one session and kind", async () => {
+  it("correlates concurrent cloned requests of one session and kind", async () => {
     await enroll(["alice", "bob"]);
     const loaded = await load({ replies: { alice: RATE_LIMITED, bob: OK } });
     const events = [0, 1].map((): V2HttpRequestEvent => ({
@@ -968,10 +984,8 @@ describe("request/response correlation", () => {
       }),
     );
 
-    // Without a safe match neither response is rotated: both stay the raw 429.
-    assert.deepEqual(answers.map((r) => r.status), [429, 429]);
-    assert.equal(loaded.sent.length, 2);
-    assert.ok(loaded.sent.every((r) => r.headers.get("authorization") === "Bearer access-alice"));
+    assert.deepEqual(answers.map((r) => r.status), [200, 200]);
+    assert.equal(loaded.sent.length, 4);
   });
 
   it("matches concurrent requests from different sessions or kinds", async () => {

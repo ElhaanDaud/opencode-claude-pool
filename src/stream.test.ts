@@ -104,6 +104,20 @@ describe("translateSseStream keepalive", () => {
 });
 
 describe("translateSseStream termination", () => {
+  it("does not drain upstream before the consumer reads", async () => {
+    let pulls = 0;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pulls++;
+        if (pulls <= 100) controller.enqueue(encoder.encode(ev("ping", { n: pulls })));
+        else controller.close();
+      },
+    });
+    const stream = translateSseStream(body, { inboundToolNameMap: {}, translateToolArgs: (json) => json }, { keepaliveMs: 0 });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.ok(pulls <= 3, `pulled ${pulls} times`);
+    await stream.cancel();
+  });
   it("does not report a cancelled stream as abandoned", async () => {
     const h = harness(0);
     h.send(START + DELTA);

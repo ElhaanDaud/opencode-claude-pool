@@ -171,6 +171,44 @@ describe("rotation state persistence", () => {
 });
 
 describe("rotation state locking", () => {
+  it("propagates non-contention lock creation errors", async (t) => {
+    const statePath = tempStatePath(t);
+    const realOpen = fs.openSync;
+    t.mock.method(fs, "openSync", (file: fs.PathLike, flags: fs.OpenMode, mode?: fs.Mode | null) => {
+      if (String(file) === `${statePath}.lock`) throw Object.assign(new Error("denied"), { code: "EACCES" });
+      return realOpen(file, flags, mode);
+    });
+    await assert.rejects(createRotationStateStore({ path: statePath }).withLock(() => {}), { code: "EACCES" });
+  });
+  it("does not remove a replacement for a stale malformed lock", async (t) => {
+    const statePath = tempStatePath(t);
+    const lockPath = `${statePath}.lock`;
+    fs.mkdirSync(path.dirname(statePath), { recursive: true });
+    fs.writeFileSync(lockPath, "");
+    fs.utimesSync(lockPath, 1, 1);
+    const realStat = fs.statSync;
+    let replaced = false;
+    t.mock.method(fs, "statSync", (file: fs.PathLike, options?: fs.StatSyncOptions) => {
+      const result = realStat(file, options);
+      if (String(file) === lockPath && !replaced) {
+        replaced = true;
+        fs.rmSync(lockPath);
+        fs.writeFileSync(lockPath, "");
+      }
+      return result;
+    });
+    const store = createRotationStateStore({ path: statePath, staleLockMs: 1000, lockTimeoutMs: 0 });
+    await assert.rejects(store.withLock(() => {}), LockTimeoutError);
+    assert.equal(fs.readFileSync(lockPath, "utf8"), "");
+  });
+
+  it("removes a newly created lock when writing it fails", async (t) => {
+    const statePath = tempStatePath(t);
+    t.mock.method(fs, "writeSync", () => { throw new Error("write failed"); });
+    const store = createRotationStateStore({ path: statePath });
+    await assert.rejects(store.withLock(() => {}), /write failed/);
+    assert.equal(fs.existsSync(`${statePath}.lock`), false);
+  });
   it("serializes concurrent read-modify-write critical sections", async (t) => {
     const statePath = tempStatePath(t);
     const first = createRotationStateStore({ path: statePath, lockPollMs: 5 });
@@ -417,6 +455,22 @@ describe("rotation state locking", () => {
 });
 
 describe("rotation state mutators", () => {
+  it("registers prototype-named labels as independent accounts", async (t) => {
+    const store = createRotationStateStore({ path: tempStatePath(t) });
+    for (const label of ["constructor", "__proto__"]) {
+      await store.ensureAccount(label);
+      await store.markCooldown(label, 12345, "limited");
+      assert.equal(Object.hasOwn(store.load().accounts, label), true);
+      assert.equal(store.load().accounts[label]?.cooldownUntil, 12345);
+    }
+  });
+
+  it("keeps a cooldown recorded in the same millisecond as a request", async (t) => {
+    const store = createRotationStateStore({ path: tempStatePath(t), clock: () => 5000 });
+    await store.markCooldown("primary", 10000, "limited");
+    await store.markSuccess("primary", 5000);
+    assert.equal(store.load().accounts.primary?.cooldownUntil, 10000);
+  });
   it("tracks cooldown failures and resets them on success", async (t) => {
     let now = 5_000;
     const store = createRotationStateStore({

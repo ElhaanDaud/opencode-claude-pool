@@ -11,7 +11,7 @@
  */
 
 import { formatDashboard } from "./dashboard.js";
-import { LabelConflictError } from "./enroll.js";
+import { LabelConflictError, removeEnrolledAccount } from "./enroll.js";
 import { renderBar, type AccountUsage } from "./usage.js";
 import type { PoolSnapshot, PoolSnapshotRow, RotationManager } from "./manager.js";
 import type { RotationStateStore } from "./rotation-state.js";
@@ -202,12 +202,15 @@ export function createPoolTui(deps: TuiDeps) {
   let cursor = 0;
   let message = "";
   let confirm: Confirm | null = null;
+  let confirmVisible = false;
   let busy = false;
   let running = false;
   let expanded = false;
   let cliEmail: string | null = null;
   let redundant = new Set<string>();
   let timer: NodeJS.Timeout | null = null;
+  let onData: ((raw: string) => void) | null = null;
+  let onResize: (() => void) | null = null;
   let exitResolve: (() => void) | null = null;
   /** Set by a signal that arrived mid-action: exits once that action settles. */
   let exitAfterAction: (() => void) | null = null;
@@ -216,6 +219,7 @@ export function createPoolTui(deps: TuiDeps) {
    * refresh). Absent means "not fetched yet".
    */
   const usage = new Map<string, AccountUsage | null | "expired">();
+  const usageRequests = new Map<string, number>();
   let pendingEscape = "";
   let scroll = 0;
   let lastFrameLines = 0;
@@ -225,7 +229,7 @@ export function createPoolTui(deps: TuiDeps) {
   function dims(): { cols: number; rows: number } {
     return {
       cols: Math.max(60, stdout.columns ?? 100),
-      rows: Math.max(10, stdout.rows ?? 24),
+      rows: Math.max(1, stdout.rows ?? 24),
     };
   }
 
@@ -240,7 +244,7 @@ export function createPoolTui(deps: TuiDeps) {
     else if (cursor >= snapshot.accounts.length) cursor = Math.max(0, snapshot.accounts.length - 1);
   }
 
-  function render(): void {
+  function render(limit?: number): void {
     // An action still in flight when the user quits (e.g. `s`) finishes later;
     // drawing then would paint the dashboard over the restored shell.
     if (!running) return;
@@ -250,7 +254,7 @@ export function createPoolTui(deps: TuiDeps) {
     // Chrome = title + cli line + optional journal warning + blank + header
     // + blank + footer. Keep a floor so a tiny terminal still shows one row.
     const chrome = 7 + (expanded ? 4 : 0);
-    const capacity = Math.max(1, rows - chrome);
+    const capacity = limit ?? Math.max(1, rows - chrome);
 
     // Keep the cursor inside the viewport, scrolling only as far as needed.
     if (cursor < scroll) scroll = cursor;
@@ -266,7 +270,6 @@ export function createPoolTui(deps: TuiDeps) {
     const disabled = accounts.filter((a) => a.status === "disabled").length;
 
     const out: string[] = [needsFullClear ? CLEAR : HOME];
-    needsFullClear = false;
     let lines = 0;
     /** Push one frame line, erasing any leftover tail from a previous frame. */
     const line = (text: string): void => {
@@ -383,6 +386,7 @@ export function createPoolTui(deps: TuiDeps) {
 
     out.push("\n");
     if (confirm) {
+      confirmVisible = out.join("").split("\n").length <= rows - 1;
       out.push(`${YELLOW}${confirm.prompt}${RESET}  ${DIM}[y/N]${RESET}${EOL}\n`);
     } else if (busy) {
       out.push(`${DIM}working…${RESET}${EOL}\n`);
@@ -390,10 +394,10 @@ export function createPoolTui(deps: TuiDeps) {
       out.push(`${message}${EOL}\n`);
     } else {
       // Two short rows beat one truncated row on a narrow terminal.
-      out.push(`${DIM}${clip(" ↑/↓ move  ⏎ details  g/G top/bottom", cols - 1)}${RESET}${EOL}\n`);
+      out.push(`${DIM}${clip(" ↑/↓ move  ⏎ details  g/G top/bottom  r reload  q quit", cols - 1)}${RESET}${EOL}\n`);
       out.push(
         `${DIM}${clip(
-          " e enroll  u re-enable  f token  s usage  a activate  x remove  c clear-all  p prune  r reload  q quit",
+          " e enroll  d disable  u re-enable  f token  s usage  a activate  x remove  c clear-all  p prune",
           cols - 1,
         )}${RESET}${EOL}\n`,
       );
@@ -406,6 +410,11 @@ export function createPoolTui(deps: TuiDeps) {
           `${scroll > 0 ? "↑" : " "}${scroll + capacity < accounts.length ? "↓" : " "}${RESET}${EOL}\n`,
       );
     }
+    const overflow = out.join("").split("\n").length - 1 - Math.max(0, rows - 1);
+    if (overflow > 0 && capacity > 0 && accounts.length > 0) {
+      return render(Math.max(0, capacity - overflow));
+    }
+    needsFullClear = false;
     lastFrameLines = Math.max(lines, frameRows);
 
     // Single choke point: guarantee no emitted line reaches the terminal width.
@@ -452,10 +461,15 @@ export function createPoolTui(deps: TuiDeps) {
       return;
     }
 
+    const request = (usageRequests.get(label) ?? 0) + 1;
+    usageRequests.set(label, request);
     try {
-      usage.set(label, await deps.fetchUsage(label, force));
-    } catch {
-      usage.set(label, null);
+      const result = await deps.fetchUsage(label, force);
+      if (usageRequests.get(label) === request) usage.set(label, result);
+      if (!result) throw new Error("usage unavailable");
+    } catch (err) {
+      if (usageRequests.get(label) === request) usage.set(label, null);
+      if (force) throw err;
     }
     if (running) render();
   }
@@ -517,7 +531,7 @@ export function createPoolTui(deps: TuiDeps) {
     if (confirm) {
       const pending = confirm;
       confirm = null;
-      if (key === "y" || key === "Y") await act(pending.prompt, pending.run);
+      if ((key === "y" || key === "Y") && (!running || confirmVisible)) await act(pending.prompt, pending.run);
       else {
         message = `${DIM}cancelled${RESET}`;
         render();
@@ -598,11 +612,27 @@ export function createPoolTui(deps: TuiDeps) {
         return `re-enabled "${target.label}" (local state only)`;
       });
     }
+    if (key === "d") {
+      const target = selected();
+      if (!target) return;
+      if (target.status === "disabled") {
+        message = `${DIM}"${target.label}" is already disabled — u re-enables it${RESET}`;
+        return render();
+      }
+      // Unlike x, the credentials stay: rotation just skips the account until
+      // u re-enables it.
+      return act("disable", async () => {
+        await deps.state.markDisabled(target.label, "disabled by hand");
+        return `disabled "${target.label}" — u re-enables it`;
+      });
+    }
     if (key === "f") {
       const target = selected();
       if (!target) return;
       return act("token refresh", async () => {
-        const tokens = await deps.pool.refreshLabel(target.label);
+        const account = await deps.accounts.getAccount(target.label);
+        if (!account) throw new Error(`Account "${target.label}" is not enrolled`);
+        const tokens = await deps.pool.refreshLabel(target.label, account.oauth.access);
         return `refreshed "${target.label}" — token now valid ${relative(tokens.expires, Date.now())}`;
       });
     }
@@ -618,8 +648,7 @@ export function createPoolTui(deps: TuiDeps) {
           .join(", ")})?`,
         run: async () => {
           for (const account of stale) {
-            await deps.accounts.removeAccount(account.label);
-            await deps.state.forget(account.label);
+            await removeEnrolledAccount(deps.accounts, deps.state, account.label);
           }
           return `pruned ${stale.length} duplicate${stale.length === 1 ? "" : "s"}`;
         },
@@ -671,8 +700,7 @@ export function createPoolTui(deps: TuiDeps) {
       confirm = {
         prompt: `Remove "${target.label}" and delete its stored credentials?`,
         run: async () => {
-          await deps.accounts.removeAccount(target.label);
-          await deps.state.forget(target.label);
+          await removeEnrolledAccount(deps.accounts, deps.state, target.label);
           return `removed "${target.label}"`;
         },
       };
@@ -686,9 +714,14 @@ export function createPoolTui(deps: TuiDeps) {
     exitResolve?.();
     exitResolve = null;
     if (timer) clearInterval(timer);
-    if (stdin.isTTY) stdin.setRawMode(false);
-    stdin.pause();
-    stdout.write(`${CURSOR_SHOW}${ALT_SCREEN_OFF}`);
+    if (onData) stdin.off("data", onData);
+    if (onResize) stdout.off("resize", onResize);
+    try {
+      if (stdin.isTTY) stdin.setRawMode(false);
+    } finally {
+      stdin.pause();
+      stdout.write(`${CURSOR_SHOW}${ALT_SCREEN_OFF}`);
+    }
     // Not force-exited: the action may be a token refresh, and killing it
     // mid-request can lose the only valid refresh token.
     if (busy) stdout.write("claude-pool: finishing the current action before exiting…\n");
@@ -742,6 +775,9 @@ export function createPoolTui(deps: TuiDeps) {
     }
 
     running = true;
+    for (const signal of EXIT_SIGNALS) process.on(signal, onSignal);
+    process.once("exit", stop);
+    try {
     await reload();
     // Best-effort: a missing/expired CLI login must not stop the UI opening.
     try {
@@ -755,7 +791,7 @@ export function createPoolTui(deps: TuiDeps) {
     stdin.setRawMode(true);
     stdin.resume();
     stdin.setEncoding("utf8");
-    stdin.on("data", (raw: string) => {
+    onData = (raw: string) => {
       const chunk = pendingEscape + raw;
       pendingEscape = "";
       void (async () => {
@@ -767,27 +803,33 @@ export function createPoolTui(deps: TuiDeps) {
         message = `${RED}${err instanceof Error ? err.message : String(err)}${RESET}`;
         render();
       });
-    });
+    };
+    stdin.on("data", onData);
 
     // Re-render on resize: widths and the viewport are both derived from the
     // terminal size, so a stale frame would be mis-aligned and truncated.
-    stdout.on("resize", () => {
+    onResize = () => {
       needsFullClear = true;
       if (running) render();
-    });
-
-    for (const signal of EXIT_SIGNALS) process.on(signal, onSignal);
+    };
+    stdout.on("resize", onResize);
 
     // Cooldowns are time-based, so the countdown must tick without input.
     timer = setInterval(() => {
-      if (!busy && !confirm) void reload().then(render);
+      if (!busy && !confirm) void reload().then(() => render()).catch((err) => {
+        message = `${RED}reload failed: ${err instanceof Error ? err.message : String(err)}${RESET}`;
+        render();
+      });
     }, 30_000);
 
-    process.once("exit", stop);
     // Resolved by stop(); polling for it burned CPU for no reason.
     await new Promise<void>((resolve) => {
       exitResolve = resolve;
     });
+    } catch (err) {
+      stop();
+      throw err;
+    }
   }
 
   return { start, stop, render, reload, onKey, get snapshot() { return snapshot; } };

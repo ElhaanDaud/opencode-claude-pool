@@ -272,51 +272,50 @@ export function translateSseStream(
   const encoder = new TextEncoder();
   let cancelled = false;
   let timer: ReturnType<typeof setInterval> | undefined;
+  let lastEmit = Date.now();
 
   return new ReadableStream<Uint8Array>({
     start(controller) {
-      let lastEmit = Date.now();
+      if (keepaliveMs > 0) {
+        timer = setInterval(() => {
+          if (!cancelled && (controller.desiredSize ?? 0) > 0 && processor.pendingToolBlocks() > 0 && Date.now() - lastEmit >= keepaliveMs) {
+            controller.enqueue(encoder.encode(KEEPALIVE_FRAME));
+            lastEmit = Date.now();
+          }
+        }, Math.max(1, Math.floor(keepaliveMs / 3)));
+        timer.unref?.();
+      }
+    },
+    async pull(controller) {
       const emit = (text: string) => {
         if (!text || cancelled) return;
         controller.enqueue(encoder.encode(text));
         lastEmit = Date.now();
       };
-      if (keepaliveMs > 0) {
-        timer = setInterval(() => {
-          if (processor.pendingToolBlocks() > 0 && Date.now() - lastEmit >= keepaliveMs) {
-            emit(KEEPALIVE_FRAME);
+      try {
+        while (!cancelled && (controller.desiredSize ?? 0) > 0) {
+          const { done, value } = await reader.read();
+          if (cancelled) {
+            processor.discard();
+            return;
           }
-        }, Math.max(1, Math.floor(keepaliveMs / 3)));
-      }
-
-      // Use start() with an async loop rather than pull(): Bun's ReadableStream
-      // doesn't reliably re-invoke pull() when the handler resolves without
-      // enqueuing (which happens while input_json_delta is buffered).
-      (async () => {
-        try {
-          while (true) {
-            const { done, value } = await reader.read();
-            if (cancelled) {
-              processor.discard();
-              return;
-            }
-            if (done) {
-              emit(processor.feedChunk(decoder.decode()));
-              emit(processor.flush());
-              controller.close();
-              return;
-            }
-            emit(processor.feedChunk(decoder.decode(value, { stream: true })));
+          if (done) {
+            emit(processor.feedChunk(decoder.decode()));
+            emit(processor.flush());
+            clearInterval(timer);
+            controller.close();
+            return;
           }
-        } catch (e) {
-          if (!cancelled) controller.error(e);
-        } finally {
-          clearInterval(timer);
+          emit(processor.feedChunk(decoder.decode(value, { stream: true })));
         }
-      })();
+      } catch (e) {
+        clearInterval(timer);
+        if (!cancelled) controller.error(e);
+      }
     },
     cancel(reason) {
       cancelled = true;
+      processor.discard();
       clearInterval(timer);
       return reader.cancel(reason);
     },

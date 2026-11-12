@@ -90,8 +90,8 @@ async function send(replies: Reply[], body: unknown) {
     method: "POST",
     body: JSON.stringify(body),
   });
-  await response.text();
-  return { status: response.status, sent, timeouts };
+  const text = await response.text();
+  return { status: response.status, sent, timeouts, text };
 }
 
 const plain = {
@@ -100,6 +100,52 @@ const plain = {
 };
 
 describe("single-account retry", () => {
+  it("preserves a Request body, method, headers and abort signal", async () => {
+    const controller = new AbortController();
+    let sent: RequestInit | undefined;
+    globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+      sent = init;
+      return new Response(OK.body, { status: 200 });
+    }) as typeof fetch;
+    const hooks = await plugin.server({ client: { auth: { set: async () => {} } } });
+    const loaded = await hooks.auth.loader(
+      async () => ({ type: "oauth", access: "token", refresh: "refresh", expires: Date.now() + 3_600_000 }),
+      { models: {} },
+    ) as { fetch: typeof fetch };
+    const request = new Request("https://api.anthropic.com/v1/messages", {
+      method: "POST", body: JSON.stringify(plain), headers: { "x-test": "request" }, signal: controller.signal,
+    });
+    await loaded.fetch(request);
+    assert.equal(sent?.method, "POST");
+    assert.equal(JSON.parse(String(sent?.body)).model, plain.model);
+    assert.equal(new Headers(sent?.headers).get("x-test"), "request");
+    controller.abort();
+    assert.equal(sent?.signal?.aborted, true);
+  });
+
+  it("honors init overrides for a Request", async () => {
+    const controller = new AbortController();
+    let sent: RequestInit | undefined;
+    globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+      sent = init;
+      return new Response(OK.body, { status: 200 });
+    }) as typeof fetch;
+    const hooks = await plugin.server({ client: { auth: { set: async () => {} } } });
+    const loaded = await hooks.auth.loader(
+      async () => ({ type: "oauth", access: "token", refresh: "refresh", expires: Date.now() + 3_600_000 }),
+      { models: {} },
+    ) as { fetch: typeof fetch };
+    const request = new Request("https://api.anthropic.com/v1/messages", {
+      method: "POST", body: JSON.stringify(plain), headers: { "x-original": "old" },
+    });
+    await loaded.fetch(request, { method: "PUT", body: JSON.stringify({ ...plain, model: "override" }), headers: { "x-new": "yes" }, signal: controller.signal });
+    assert.equal(sent?.method, "PUT");
+    assert.equal(JSON.parse(String(sent?.body)).model, "override");
+    assert.equal(new Headers(sent?.headers).get("x-original"), null);
+    assert.equal(new Headers(sent?.headers).get("x-new"), "yes");
+    assert.equal(sent?.signal, controller.signal);
+  });
+
   it("retries a 529 and returns the recovered response", async () => {
     const { status, sent } = await send(
       [{ status: 529, headers: { "retry-after": "0" } }, OK],
@@ -180,6 +226,23 @@ function cliLogin(access: string, refresh: string) {
 const refreshedOnly = (bearer: string) => (bearer.endsWith("/access") ? 200 : 401);
 
 describe("single-account refresh", () => {
+  it("rebinds generated metadata when retrying with a different CLI account", async () => {
+    const sent: Array<{ bearer: string; uuid: string }> = [];
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      const bearer = new Headers(init?.headers).get("authorization") ?? "";
+      if (String(url).includes("/oauth/profile")) return Response.json({ account: { uuid: bearer.endsWith("identity-a") ? "uuid-a" : "uuid-b" } });
+      const body = JSON.parse(String(init?.body));
+      sent.push({ bearer, uuid: JSON.parse(body.metadata.user_id).account_uuid });
+      return new Response(OK.body, { status: bearer.endsWith("identity-a") ? 401 : 200 });
+    }) as typeof fetch;
+    const store = { auth: { type: "oauth", access: "identity-a", refresh: "identity-a-refresh", expires: Date.now() + 3_600_000 } };
+    const hooks = await plugin.server({ client: { auth: { set: async () => {} } } });
+    const loaded = await hooks.auth.loader(async () => ({ ...store.auth }), { models: {} }) as { fetch: typeof fetch };
+    cliLogin("identity-b", "identity-b-refresh");
+    const response = await loaded.fetch("https://api.anthropic.com/v1/messages", { method: "POST", body: JSON.stringify(plain) });
+    assert.equal(response.status, 200);
+    assert.deepEqual(sent, [{ bearer: "Bearer identity-a", uuid: "uuid-a" }, { bearer: "Bearer identity-b", uuid: "uuid-b" }]);
+  });
   it("shares one refresh between concurrent requests", async () => {
     liveRefreshTokens.add("shared");
     const store = { auth: { type: "oauth", access: "old", refresh: "shared", expires: Date.now() - 1000 } };
@@ -272,6 +335,40 @@ describe("single-account refresh", () => {
 });
 
 describe("request body rewrite", () => {
+  it("routes colliding tool histories and choices using their own schemas in either order", async () => {
+    const builtin = { name: "read", description: "builtin", input_schema: { type: "object" } };
+    const custom = { name: "Read", description: "custom", input_schema: { type: "object" } };
+    for (const tools of [[builtin, custom], [custom, builtin]]) {
+      const { sent } = await send([OK], {
+        ...plain, tools, tool_choice: { type: "tool", name: "read" },
+        messages: [{ role: "assistant", content: [
+          { type: "tool_use", id: "a", name: "read", input: { filePath: "/a" } },
+          { type: "tool_use", id: "b", name: "Read", input: { file_path: "/b", pages: "1" } },
+        ] }],
+      });
+      assert.deepEqual(sent[0]!.tool_choice, { type: "tool", name: "read" });
+      const messages = sent[0]!.messages as Array<{ content: Array<{ name: string; input: unknown }> }>;
+      assert.deepEqual(messages[0]!.content.map(({ name, input }) => ({ name, input })), [
+        { name: "read", input: { filePath: "/a" } }, { name: "Read", input: { file_path: "/b", pages: "1" } },
+      ]);
+    }
+  });
+  it("preserves custom Claude-named tool arguments in history and responses", async () => {
+    const args = { file_path: "/a", pages: "1-2" };
+    const events = [
+      { type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "t", name: "Read", input: {} } },
+      { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: JSON.stringify(args) } },
+      { type: "content_block_stop", index: 0 },
+    ].map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join("");
+    const { sent, text } = await send([{ status: 200, body: events }], {
+      ...plain, tools: [{ name: "Read", input_schema: { type: "object" } }],
+      messages: [{ role: "assistant", content: [{ type: "tool_use", id: "t", name: "Read", input: args }] }],
+    });
+    const messages = sent[0]!.messages as Array<{ content: Array<{ input: unknown }> }>;
+    assert.deepEqual(messages[0]!.content[0]!.input, args);
+    const delta = text.split("\n").filter((line) => line.startsWith("data: ")).map((line) => JSON.parse(line.slice(6))).find((event) => event.type === "content_block_delta");
+    assert.deepEqual(JSON.parse(delta.delta.partial_json), args);
+  });
   it("keeps OpenCode's system blocks after Claude Code's prompt", async () => {
     const { sent } = await send([OK], {
       ...plain,

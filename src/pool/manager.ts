@@ -99,6 +99,8 @@ export type AcquireResult =
 /** Cooldown applied when a refresh fails for a reason that may resolve itself. */
 export const TRANSIENT_REFRESH_COOLDOWN_MS = 60_000;
 
+class JournalQuarantineError extends Error {}
+
 /**
  * Distinguish "this credential is no longer valid" from "the token endpoint
  * was unreachable". refreshTokens throws `Token refresh failed (<status>): …`,
@@ -229,6 +231,7 @@ export function createRotationManager(opts: ManagerOptions) {
           err instanceof Error ? err.message : String(err)
         }`,
       );
+      throw new JournalQuarantineError(err instanceof Error ? err.message : String(err));
     }
   }
 
@@ -440,7 +443,7 @@ export function createRotationManager(opts: ManagerOptions) {
           // blip or a 5xx from the token endpoint must cool the account down
           // instead, or one transient outage disables every account in turn and
           // wedges the pool with no automatic recovery.
-          if (isCredentialRejected(detail)) {
+          if (!(err instanceof JournalQuarantineError) && isCredentialRejected(detail)) {
             await disable(label, `refresh rejected: ${detail}`);
           } else {
             await state.markCooldown(

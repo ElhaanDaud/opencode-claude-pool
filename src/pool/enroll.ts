@@ -7,6 +7,7 @@ import type {
   Clock,
 } from "./types.js";
 import type { AccountStore } from "./manager.js";
+import type { RotationStateStore } from "./rotation-state.js";
 import { PROFILE_URL } from "../constants.js";
 import { claudeCredentialsPath } from "../keychain.js";
 
@@ -198,6 +199,7 @@ function firstFreeLabel(base: string, accounts: AccountRecord[]): string {
 
 export interface EnrollOptions {
   accounts: AccountStore;
+  lock?: <T>(fn: () => Promise<T>) => Promise<T>;
   /** Optional: derived from the account's email when omitted. */
   label?: string;
   clock?: Clock;
@@ -227,62 +229,87 @@ export async function enrollFromClaudeCli(
       ? undefined
       : await resolve(creds.claudeAiOauth.accessToken);
 
-  const existing = await opts.accounts.listAccounts();
-  const sameEmail = findByEmail(existing, email);
+  const run = opts.lock ?? (async <T>(fn: () => Promise<T>) => fn());
+  return run(async () => {
+    const existing = await opts.accounts.listAccounts();
+    const sameEmail = findByEmail(existing, email);
 
-  let label: string;
-  if (opts.label !== undefined) {
-    label = normalizeLabel(opts.label);
-  } else if (sameEmail) {
-    label = sameEmail.label;
-  } else if (email) {
-    label = deriveLabelFromEmail(email);
-  } else {
-    throw new EnrollmentError(
-      "Could not determine an account label. Pass one explicitly: claude-pool enroll <label>",
-    );
-  }
-
-  if (sameEmail && sameEmail.label !== label) {
-    throw new EnrollmentError(
-      `${email} is already enrolled as "${sameEmail.label}"; an account can hold only one label.`,
-    );
-  }
-
-  if (sameEmail && !supersedes(creds.claudeAiOauth, sameEmail)) {
-    throw new EnrollmentError(
-      `${email} is already enrolled as "${sameEmail.label}" with newer credentials than the Claude CLI's copy; kept the pool's. Run \`claude login\` as this account to replace them.`,
-    );
-  }
-
-  const duplicate = existing.find(
-    (a) => a.oauth.refresh === creds.claudeAiOauth.refreshToken,
-  );
-  if (duplicate && duplicate.label !== label) {
-    throw new EnrollmentError(
-      `That account is already enrolled as "${duplicate.label}". Run \`claude login\` as a different account before enrolling again.`,
-    );
-  }
-
-  const sameLabelDifferentAccount = existing.find(
-    (a) => a.label === label
-      && a !== sameEmail
-      && a.oauth.refresh !== creds.claudeAiOauth.refreshToken,
-  );
-  if (sameLabelDifferentAccount && opts.replace !== true) {
-    const derived = opts.label === undefined;
-    const otherPerson = Boolean(email && sameLabelDifferentAccount.email);
-    if (derived && otherPerson) {
-      // alice@work and alice@home derive the same label; both belong in the pool.
-      label = firstFreeLabel(label, existing);
+    let label: string;
+    if (opts.label !== undefined) {
+      label = normalizeLabel(opts.label);
+    } else if (sameEmail) {
+      label = sameEmail.label;
+    } else if (email) {
+      label = deriveLabelFromEmail(email);
     } else {
-      throw new LabelConflictError(label, sameLabelDifferentAccount.email ?? null);
+      throw new EnrollmentError(
+        "Could not determine an account label. Pass one explicitly: claude-pool enroll <label>",
+      );
     }
-  }
 
-  const record = toAccountRecord(label, creds, now, email);
-  await opts.accounts.putAccount(record);
-  return record;
+    if (sameEmail && sameEmail.label !== label) {
+      throw new EnrollmentError(
+        `${email} is already enrolled as "${sameEmail.label}"; an account can hold only one label.`,
+      );
+    }
+
+    if (sameEmail && !supersedes(creds.claudeAiOauth, sameEmail)) {
+      throw new EnrollmentError(
+        `${email} is already enrolled as "${sameEmail.label}" with newer credentials than the Claude CLI's copy; kept the pool's. Run \`claude login\` as this account to replace them.`,
+      );
+    }
+
+    const duplicate = existing.find(
+      (a) => a.oauth.refresh === creds.claudeAiOauth.refreshToken,
+    );
+    if (duplicate && duplicate.label !== label) {
+      throw new EnrollmentError(
+        `That account is already enrolled as "${duplicate.label}". Run \`claude login\` as a different account before enrolling again.`,
+      );
+    }
+
+    const sameLabelDifferentAccount = existing.find(
+      (a) => a.label === label
+        && a !== sameEmail
+        && a.oauth.refresh !== creds.claudeAiOauth.refreshToken,
+    );
+    if (sameLabelDifferentAccount && opts.replace !== true) {
+      const derived = opts.label === undefined;
+      const otherPerson = Boolean(email && sameLabelDifferentAccount.email);
+      if (derived && otherPerson) {
+        // alice@work and alice@home derive the same label; both belong in the pool.
+        label = firstFreeLabel(label, existing);
+      } else {
+        throw new LabelConflictError(label, sameLabelDifferentAccount.email ?? null);
+      }
+    }
+
+    // A failed profile lookup must not erase the email of a provably identical
+    // account, or its next enrollment can't be matched and gets a second label.
+    const preservedEmail = duplicate?.label === label ? duplicate.email : undefined;
+    const record = toAccountRecord(label, creds, now, email ?? preservedEmail);
+    await opts.accounts.putAccount(record);
+    return record;
+  });
+}
+
+/**
+ * Drop an account's credentials and rotation entry under the rotation lock, so
+ * an in-flight refresh cannot write its tokens back after the removal. Returns
+ * false when the label is unknown to both.
+ */
+export async function removeEnrolledAccount(
+  accounts: AccountStore,
+  state: RotationStateStore,
+  label: string,
+): Promise<boolean> {
+  return state.withLock(async (rotation) => {
+    if (!(await accounts.getAccount(label)) && !Object.hasOwn(rotation.accounts, label)) return false;
+    await accounts.removeAccount(label);
+    delete rotation.accounts[label];
+    if (rotation.activeLabel === label) rotation.activeLabel = null;
+    return true;
+  });
 }
 
 /**
@@ -325,6 +352,7 @@ export interface AutoEnrollResult {
 
 export interface AutoEnrollOptions {
   accounts: AccountStore;
+  lock?: <T>(fn: () => Promise<T>) => Promise<T>;
   clock?: Clock;
   readCredentials?: () => string;
   resolveEmail?: (accessToken: string) => Promise<string | undefined>;
@@ -385,41 +413,53 @@ export async function autoEnrollIfNew(
   }
   if (!email) return { status: "no-label" };
 
-  const sameEmail = findByEmail(existing, email);
-  if (sameEmail) {
-    // Copying the login into a healthy entry would leave the pool and the CLI
-    // sharing one single-use refresh token, so only repair a disabled one.
-    let disabled: boolean;
-    try {
-      disabled = (await opts.isDisabled?.(sameEmail.label)) === true;
-    } catch {
-      disabled = false;
-    }
-    if (!disabled || !supersedes(oauth, sameEmail)) {
-      return { status: "already-enrolled", label: sameEmail.label, email };
-    }
-    try {
-      await opts.accounts.putAccount(toAccountRecord(sameEmail.label, creds, now, email));
-    } catch {
-      return { status: "unavailable" };
-    }
-    return { status: "repaired", label: sameEmail.label, email };
-  }
-
-  let label: string;
+  const run = opts.lock ?? (async <T>(fn: () => Promise<T>) => fn());
   try {
-    label = deriveLabelFromEmail(email);
-  } catch {
-    return { status: "no-label" };
-  }
+    return await run(async (): Promise<AutoEnrollResult> => {
+      existing = await opts.accounts.listAccounts();
+      if (existing.length === 0) return { status: "pool-empty" };
+      const current = existing.find((a) => a.oauth.refresh === oauth.refreshToken);
+      if (current) return { status: "already-enrolled", label: current.label };
+      const sameEmail = findByEmail(existing, email);
+      if (sameEmail) {
+        // Copying the login into a healthy entry would leave the pool and the CLI
+        // sharing one single-use refresh token, so only repair a disabled one.
+        let disabled: boolean;
+        try {
+          disabled = (await opts.isDisabled?.(sameEmail.label)) === true;
+        } catch {
+          disabled = false;
+        }
+        if (!disabled || !supersedes(oauth, sameEmail)) {
+          return { status: "already-enrolled", label: sameEmail.label, email };
+        }
+        try {
+          await opts.accounts.putAccount(toAccountRecord(sameEmail.label, creds, now, email));
+        } catch {
+          return { status: "unavailable" };
+        }
+        return { status: "repaired", label: sameEmail.label, email };
+      }
 
-  label = firstFreeLabel(label, existing);
+      let label: string;
+      try {
+        label = deriveLabelFromEmail(email);
+      } catch {
+        return { status: "no-label" };
+      }
 
-  try {
-    await opts.accounts.putAccount(toAccountRecord(label, creds, now, email));
+      label = firstFreeLabel(label, existing);
+
+      try {
+        await opts.accounts.putAccount(toAccountRecord(label, creds, now, email));
+      } catch {
+        return { status: "unavailable" };
+      }
+
+      return { status: "enrolled", label, email };
+    });
   } catch {
+    // Includes a lock timeout: startup must not fail over a busy lock.
     return { status: "unavailable" };
   }
-
-  return { status: "enrolled", label, email };
 }

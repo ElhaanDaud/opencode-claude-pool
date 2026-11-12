@@ -293,15 +293,12 @@ export function translateArgsOpencodeToClaude(
     }
   }
 
-  // 2. Agent: translate OpenCode subagent_type values → Claude values;
-  //    strip OpenCode-only fields that aren't in Claude's schema.
+  // 2. Agent: translate OpenCode subagent_type values → Claude values.
   if (toolName === "Agent") {
     if (typeof out.subagent_type === "string") {
       const mapped = AGENT_TYPE_OPENCODE_TO_CLAUDE[out.subagent_type];
       if (mapped) out.subagent_type = mapped;
     }
-    delete out.task_id;
-    delete out.command;
   }
 
   // 3. TodoWrite: OpenCode { priority, status∈{…,cancelled} } → Claude
