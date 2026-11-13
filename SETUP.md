@@ -34,7 +34,7 @@ account enrolled the pool works but has nowhere to rotate to.
 ```bash
 git clone https://github.com/ElhaanDaud/opencode-claude-pool.git ~/src/opencode-claude-bridge
 cd ~/src/opencode-claude-bridge
-npm ci
+npm ci --ignore-scripts
 npm run build
 ```
 
@@ -261,6 +261,8 @@ node scripts/qa-rotation.mjs s3   # run one scenario (s1–s10)
 | `~/.local/share/opencode-claude-bridge/rotation-state.json` | Active account, cooldowns, failure counts. No secrets | `0600` |
 | `~/.local/share/opencode-claude-bridge/refresh-journal.json` | Transient; exists only mid-refresh | `0600` |
 | `~/.local/share/opencode-claude-bridge/refresh-journal.json.<id>.stale` | A journal set aside because its account was removed or re-enrolled. May hold a live token; delete once the account works | `0600` |
+| `~/.local/share/opencode-claude-bridge/single-account-owner.json` | Without a pool: fingerprints (not tokens) of the login OpenCode made itself, which only the bridge refreshes | `0600` |
+| `~/.local/share/opencode-claude-bridge/single-account-journal.json` (and `.<id>.stale`) | Without a pool: refreshed tokens not yet saved to `auth.json`, or set aside because the login was replaced. May hold a live token | `0600` |
 
 If `CLAUDE_CONFIG_DIR` is set, the Claude CLI credential lives at
 `$CLAUDE_CONFIG_DIR/.credentials.json` instead of `~/.claude/` — the bridge
@@ -362,7 +364,7 @@ when the variable is set, the bridge reads
 ```bash
 cd ~/src/opencode-claude-bridge
 git pull
-npm ci && npm run build
+npm ci --ignore-scripts && npm run build
 ```
 
 Restart OpenCode. Enrolled accounts survive upgrades — they live in the

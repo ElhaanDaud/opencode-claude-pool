@@ -68,7 +68,7 @@ git -C ~/src/opencode-claude-bridge pull --ff-only
 Then build and test:
 
 ```bash
-cd ~/src/opencode-claude-bridge && npm ci && npm run build && npm test
+cd ~/src/opencode-claude-bridge && npm ci --ignore-scripts && npm run build && npm test
 ```
 
 All tests must pass before you continue.
