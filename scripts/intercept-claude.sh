@@ -33,7 +33,7 @@ const server = http.createServer((req, res) => {
     count++;
     const file = path.join(dir, String(count));
     const headers = { ...req.headers };
-    for (const k of ['authorization', 'x-api-key']) if (headers[k]) headers[k] = '<redacted>';
+    for (const k of ['authorization', 'proxy-authorization', 'x-api-key', 'cookie']) if (headers[k]) headers[k] = '<redacted>';
     fs.writeFileSync(file + '-headers.json', JSON.stringify({
       method: req.method,
       url: req.url,
@@ -45,7 +45,7 @@ const server = http.createServer((req, res) => {
 
     // Print key headers
     const h = req.headers;
-    console.error('  auth: ' + (h.authorization ? 'Bearer ...' + h.authorization.slice(-8) : h['x-api-key'] ? 'API key ...' + h['x-api-key'].slice(-8) : 'NONE'));
+    console.error('  auth: ' + (h.authorization ? 'Bearer (redacted)' : h['x-api-key'] ? 'API key (redacted)' : 'NONE'));
     console.error('  beta: ' + (h['anthropic-beta'] || 'NONE'));
     console.error('  ua:   ' + (h['user-agent'] || 'NONE'));
 

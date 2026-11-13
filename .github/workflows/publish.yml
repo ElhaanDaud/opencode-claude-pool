@@ -1,21 +1,30 @@
 name: Publish to npm
 
+# Runs only after CI has passed on a push to main, so a commit that fails its
+# tests is never published. The version check below makes a run without a
+# version bump a no-op.
 on:
-  push:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
     branches: [main]
-    paths:
-      - 'package.json'
 
 jobs:
   publish:
     # The npm package belongs to upstream; forks must not publish under its name.
-    if: github.repository == 'dotCipher/opencode-claude-bridge'
+    if: >-
+      github.repository == 'dotCipher/opencode-claude-bridge' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: write
       id-token: write
     steps:
       - uses: actions/checkout@v5
+        with:
+          # The commit CI tested, not whatever main points at now.
+          ref: ${{ github.event.workflow_run.head_sha }}
       - uses: actions/setup-node@v5
         with:
           node-version: 22
@@ -47,6 +56,7 @@ jobs:
         run: |
           VERSION="${{ steps.version.outputs.current }}"
           gh release create "v${VERSION}" \
+            --target "${{ github.event.workflow_run.head_sha }}" \
             --title "v${VERSION}" \
             --notes "Published to npm: https://www.npmjs.com/package/opencode-claude-bridge/v/${VERSION}" \
             --latest

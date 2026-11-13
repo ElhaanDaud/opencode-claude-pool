@@ -108,10 +108,20 @@ async function safeFetchUsage(accessToken) {
   }
 }
 
+// Captures are written to disk and diffed, so no part of a credential may
+// survive: even a suffix narrows a token down.
+const SECRET_HEADERS = new Set([
+  "authorization",
+  "proxy-authorization",
+  "x-api-key",
+  "cookie",
+  "set-cookie",
+]);
+
 function redactHeaders(headers) {
   const copy = { ...headers };
-  if (copy.authorization) {
-    copy.authorization = `Bearer ...${String(copy.authorization).slice(-8)}`;
+  for (const name of Object.keys(copy)) {
+    if (SECRET_HEADERS.has(name.toLowerCase())) copy[name] = "<redacted>";
   }
   return copy;
 }
