@@ -16,6 +16,7 @@ import { renderBar, type AccountUsage } from "./usage.js";
 import type { PoolSnapshot, PoolSnapshotRow, RotationManager } from "./manager.js";
 import type { RotationStateStore } from "./rotation-state.js";
 import type { createAccountStore } from "./secret-store.js";
+import type { AccountRecord, RotationState } from "./types.js";
 
 type AccountStore = ReturnType<typeof createAccountStore>;
 
@@ -98,8 +99,10 @@ function relative(target: number, now: number): string {
  * entry dies with invalid_grant. Flagging the redundant ones makes that
  * accumulation visible instead of something discovered much later.
  */
-export function findRedundant(accounts: PoolSnapshotRow[]): Set<string> {
-  const byEmail = new Map<string, PoolSnapshotRow[]>();
+type RedundancyRow = Pick<PoolSnapshotRow, "label" | "email" | "status" | "active">;
+
+export function findRedundant(accounts: RedundancyRow[]): Set<string> {
+  const byEmail = new Map<string, RedundancyRow[]>();
   for (const account of accounts) {
     if (!account.email) continue;
     const list = byEmail.get(account.email) ?? [];
@@ -120,6 +123,30 @@ export function findRedundant(accounts: PoolSnapshotRow[]): Set<string> {
     }
   }
   return redundant;
+}
+
+/**
+ * Whether `label` is still redundant, judged from the store and rotation state
+ * read under the removal lock rather than from the snapshot the prompt showed.
+ * Status mirrors RotationManager.snapshot().
+ */
+function stillRedundant(records: AccountRecord[], rotation: RotationState, label: string, now: number): boolean {
+  const rows = records.map((record): RedundancyRow => {
+    const account = Object.hasOwn(rotation.accounts, record.label) ? rotation.accounts[record.label] : undefined;
+    const cooling = account?.cooldownUntil != null && account.cooldownUntil > now;
+    return {
+      label: record.label,
+      email: record.email ?? null,
+      status: account?.disabled ? "disabled" : cooling ? "cooling" : "ready",
+      active: rotation.activeLabel === record.label,
+    };
+  });
+  return findRedundant(rows).has(label);
+}
+
+/** The same enrollment the prompt showed: re-enrolling a label mints a new record. */
+function sameEnrollment(record: AccountRecord | null, shown: PoolSnapshotRow): boolean {
+  return record !== null && record.enrolledAt === shown.enrolledAt && (record.email ?? null) === shown.email;
 }
 
 function pad(text: string, width: number): string {
@@ -192,6 +219,29 @@ export function clipFrame(frame: string, width: number, height?: number): string
 
 function clip(text: string, width: number): string {
   return text.length > width ? `${text.slice(0, width - 1)}…` : text;
+}
+
+/** Word-wrap to `width`, hard-breaking words longer than a line. Never truncates. */
+function wrap(text: string, width: number): string[] {
+  const lines: string[] = [];
+  let current = "";
+  for (let word of text.split(/\s+/).filter(Boolean)) {
+    while (word.length > width) {
+      if (current) lines.push(current);
+      current = "";
+      lines.push(word.slice(0, width));
+      word = word.slice(width);
+    }
+    if (!word) continue;
+    if (current && current.length + 1 + word.length > width) {
+      lines.push(current);
+      current = word;
+    } else {
+      current = current ? `${current} ${word}` : word;
+    }
+  }
+  if (current) lines.push(current);
+  return lines;
 }
 
 export function createPoolTui(deps: TuiDeps) {
@@ -386,8 +436,12 @@ export function createPoolTui(deps: TuiDeps) {
 
     out.push("\n");
     if (confirm) {
-      confirmVisible = out.join("").split("\n").length <= rows - 1;
-      out.push(`${YELLOW}${confirm.prompt}${RESET}  ${DIM}[y/N]${RESET}${EOL}\n`);
+      // Wrapped, never clipped: a destructive prompt must show its whole
+      // target and consequence, and y is honoured only if every line of it
+      // made it into the frame.
+      const prompt = wrap(`${confirm.prompt}  [y/N]`, cols - 1);
+      confirmVisible = out.join("").split("\n").length + prompt.length - 1 <= rows - 1;
+      for (const text of prompt) out.push(`${YELLOW}${text}${RESET}${EOL}\n`);
     } else if (busy) {
       out.push(`${DIM}working…${RESET}${EOL}\n`);
     } else if (message) {
@@ -647,10 +701,21 @@ export function createPoolTui(deps: TuiDeps) {
           .map((a) => a.label)
           .join(", ")})?`,
         run: async () => {
+          let pruned = 0;
           for (const account of stale) {
-            await removeEnrolledAccount(deps.accounts, deps.state, account.label);
+            const removed = await removeEnrolledAccount(
+              deps.accounts,
+              deps.state,
+              account.label,
+              async (record, rotation) =>
+                sameEnrollment(record, account) &&
+                stillRedundant(await deps.accounts.listAccounts(), rotation, account.label, Date.now()),
+            );
+            if (removed) pruned += 1;
           }
-          return `pruned ${stale.length} duplicate${stale.length === 1 ? "" : "s"}`;
+          const skipped = stale.length - pruned;
+          return `pruned ${pruned} duplicate${pruned === 1 ? "" : "s"}` +
+            (skipped > 0 ? `; kept ${skipped} that changed since the prompt` : "");
         },
       };
       return render();
@@ -700,7 +765,13 @@ export function createPoolTui(deps: TuiDeps) {
       confirm = {
         prompt: `Remove "${target.label}" and delete its stored credentials?`,
         run: async () => {
-          await removeEnrolledAccount(deps.accounts, deps.state, target.label);
+          const removed = await removeEnrolledAccount(
+            deps.accounts,
+            deps.state,
+            target.label,
+            (record) => sameEnrollment(record, target),
+          );
+          if (!removed) throw new Error(`"${target.label}" changed since the prompt; nothing was removed`);
           return `removed "${target.label}"`;
         },
       };
@@ -717,15 +788,20 @@ export function createPoolTui(deps: TuiDeps) {
     if (onData) stdin.off("data", onData);
     if (onResize) stdout.off("resize", onResize);
     try {
-      if (stdin.isTTY) stdin.setRawMode(false);
-    } finally {
+      try {
+        if (stdin.isTTY) stdin.setRawMode(false);
+      } catch {
+        // The terminal is gone (EIO after SIGHUP): there is no mode left to
+        // restore, and throwing here would skip the cleanup below.
+      }
       stdin.pause();
       stdout.write(`${CURSOR_SHOW}${ALT_SCREEN_OFF}`);
+    } finally {
+      // Not force-exited: the action may be a token refresh, and killing it
+      // mid-request can lose the only valid refresh token.
+      if (busy) stdout.write("claude-pool: finishing the current action before exiting…\n");
+      else release();
     }
-    // Not force-exited: the action may be a token refresh, and killing it
-    // mid-request can lose the only valid refresh token.
-    if (busy) stdout.write("claude-pool: finishing the current action before exiting…\n");
-    else release();
   }
 
   /**
@@ -785,6 +861,9 @@ export function createPoolTui(deps: TuiDeps) {
     } catch {
       cliEmail = null;
     }
+    // Quit (q, a signal) while those were loading: stop() already restored
+    // the terminal, so taking it over now would strand the user in raw mode.
+    if (!running) return;
     stdout.write(`${ALT_SCREEN_ON}${CURSOR_HIDE}`);
     render();
 

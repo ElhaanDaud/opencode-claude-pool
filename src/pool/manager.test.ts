@@ -180,6 +180,22 @@ describe("rotation manager activation", () => {
     assert.deepEqual(h.refreshCalls, []);
     assert.equal(fs.readFileSync(h.journalPath, "utf8"), journal);
   });
+  it("syncs the journal's directory after publishing it", async (t) => {
+    const h = harness(t, [record("alice", { expires: NOW - 1 })]);
+    const events: string[] = [];
+    const rename = fs.renameSync;
+    t.mock.method(fs, "renameSync", (oldPath: fs.PathLike, newPath: fs.PathLike) => {
+      rename(oldPath, newPath);
+      if (String(newPath) === h.journalPath) events.push("publish");
+    });
+    const fsync = fs.fsyncSync;
+    t.mock.method(fs, "fsyncSync", (fd: number) => {
+      fsync(fd);
+      if (fs.fstatSync(fd).isDirectory()) events.push("sync-dir");
+    });
+    await h.manager.refreshLabel("alice");
+    assert.deepEqual(events.slice(0, 2), ["publish", "sync-dir"]);
+  });
   it("stays inactive until an account is enrolled", async (t) => {
     const empty = harness(t, []);
     assert.equal(await empty.manager.isActive(), false);

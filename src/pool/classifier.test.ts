@@ -243,6 +243,32 @@ describe("classify", () => {
     assert.equal(decision.until, NOW + 2 * 60 * 60 * 1000);
     assert.equal(decision.source, "body-hint");
   });
+
+  it("prefers a reset timestamp in the message over an unrelated duration", () => {
+    const resetAt = new Date(NOW + 2 * 60 * 60 * 1000).toISOString();
+    const decision = classify(
+      input({ bodyText: JSON.stringify({ error: { message: `50 messages per 5h; resets at ${resetAt}` } }) }),
+    );
+
+    assert.equal(decision.until, NOW + 2 * 60 * 60 * 1000);
+  });
+
+  it("ignores a duration not introduced by in or after", () => {
+    const decision = classify(
+      input({ bodyText: JSON.stringify({ error: { message: "Limit is 50 messages per 5h" } }) }),
+    );
+
+    assert.equal(decision.source, "default");
+  });
+
+  it("does not let a zero retry-after make a rejected window selectable", () => {
+    const decision = classify(input({
+      headers: { "anthropic-ratelimit-unified-status": "rejected", "retry-after": "0" },
+    }));
+
+    assert.equal(decision.action, "ROTATE_COOLDOWN");
+    assert.equal(decision.until, NOW + DEFAULT_UNKNOWN_COOLDOWN_MS);
+  });
 });
 
 describe("usage window hints", () => {

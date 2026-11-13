@@ -11,6 +11,12 @@ it("skips malformed keychain candidates before a valid credential", () => {
   assert.deepEqual(selectClaudeCredentials([malformed, valid]), valid);
 });
 
+it("skips candidates with empty tokens before a valid credential", () => {
+  const empty = JSON.parse('{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":9999999999999}}');
+  const valid = JSON.parse('{"claudeAiOauth":{"accessToken":"access","refreshToken":"refresh","expiresAt":9999999999999}}');
+  assert.deepEqual(selectClaudeCredentials([empty, valid]), valid);
+});
+
 it("uses the valid unscoped keychain item when the scoped item is malformed", () => {
   const dir = mkdtempSync(join(tmpdir(), "keychain-test-"));
   const oldPath = process.env.PATH;

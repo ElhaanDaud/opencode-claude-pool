@@ -39,7 +39,9 @@ export function selectClaudeCredentials(
 ): KeychainCredentials | null {
   for (const candidate of candidates) {
     const oauth = candidate?.claudeAiOauth;
-    if (oauth && typeof oauth.accessToken === "string" && typeof oauth.refreshToken === "string" &&
+    // An empty token is as unusable as a missing one, and must not shadow a later valid candidate.
+    if (oauth && typeof oauth.accessToken === "string" && oauth.accessToken !== "" &&
+        typeof oauth.refreshToken === "string" && oauth.refreshToken !== "" &&
         typeof oauth.expiresAt === "number" && Number.isFinite(oauth.expiresAt)) return candidate;
   }
   return null;

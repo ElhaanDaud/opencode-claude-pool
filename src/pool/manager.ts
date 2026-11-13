@@ -213,6 +213,18 @@ export function createRotationManager(opts: ManagerOptions) {
       try { fs.rmSync(tmp, { force: true }); } catch { /* best effort */ }
       throw err;
     }
+    // The rename lives in the directory entry, not the file: without syncing
+    // the directory, power loss can drop the journal despite the file fsync.
+    let dirFd: number | undefined;
+    try {
+      dirFd = fs.openSync(dir, "r");
+      fs.fsyncSync(dirFd);
+    } catch {
+      // Not every platform can open or fsync a directory (Windows); the
+      // journal is still published, only less durable.
+    } finally {
+      if (dirFd !== undefined) fs.closeSync(dirFd);
+    }
   }
 
   function clearJournal(): void {

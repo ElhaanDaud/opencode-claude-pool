@@ -50,7 +50,7 @@ describe("dashboard regressions", () => {
         snapshot: options.snapshot ?? (async () => ({ activeLabel: null, now: 0, accounts: Array.from({ length: 30 }, (_, i) => row(`account-${i}`, "ready")) })),
         pendingRefreshLabel: () => "account-0",
       } as unknown as TuiDeps["pool"],
-      accounts: { getAccount: async () => ({}), removeAccount: async (label: string) => { removed.push(label); } } as unknown as TuiDeps["accounts"],
+      accounts: { getAccount: async () => ({ enrolledAt: 0, email: null }), removeAccount: async (label: string) => { removed.push(label); } } as unknown as TuiDeps["accounts"],
       state: lockedState() as unknown as TuiDeps["state"],
       enroll: async () => "", whoami: async () => "cli@example.com", fetchUsage: options.fetchUsage,
       stdin: stdin as unknown as NodeJS.ReadStream, stdout: stdout as unknown as NodeJS.WriteStream,
@@ -81,6 +81,51 @@ describe("dashboard regressions", () => {
     ui.tui.stop();
     await started;
     assert.deepEqual(ui.removed, []);
+  });
+
+  it("does not accept a confirmation whose prompt is cut off at the right edge", async () => {
+    const label = "a".repeat(64);
+    const ui = fixture({ snapshot: async () => ({ activeLabel: null, now: 0, accounts: [row(label, "ready")] }) });
+    ui.stdout.columns = 60;
+    const started = ui.tui.start();
+    await tick();
+    await ui.tui.onKey("x");
+    const frame = ui.writes.at(-1)!.replace(/\u001b\[[0-9;?]*[A-Za-z]/g, "");
+    await ui.tui.onKey("y");
+    ui.tui.stop();
+    await started;
+    const shown = frame.split("\n").map((line) => line.trim()).join("");
+    assert.ok(shown.includes(label), "label shown in full");
+    assert.ok(shown.replace(/\s+/g, "").includes("deleteitsstoredcredentials"), "consequence shown");
+    assert.ok(shown.includes("[y/N]"), "choice shown");
+    assert.ok(frame.split("\n").every((line) => line.length < 60));
+    assert.deepEqual(ui.removed, [label]);
+  });
+
+  it("releases signal handlers even when raw mode cannot be restored", async () => {
+    const before = process.listenerCount("SIGINT");
+    const ui = fixture({ raw: (enabled) => { if (!enabled) throw new Error("EIO"); } });
+    const started = ui.tui.start();
+    await tick();
+    try { ui.tui.stop(); } catch { /* the probe only cares about cleanup */ }
+    await started;
+    assert.equal(process.listenerCount("SIGINT"), before);
+  });
+
+  it("does not enter raw mode when stopped while the first snapshot loads", async () => {
+    let finish!: () => void;
+    const raw: boolean[] = [];
+    const ui = fixture({
+      raw: (enabled) => { raw.push(enabled); },
+      snapshot: () => new Promise((resolve) => { finish = () => resolve({ activeLabel: null, now: 0, accounts: [] }); }),
+    });
+    const started = ui.tui.start();
+    await tick();
+    ui.tui.stop();
+    finish();
+    await started;
+    assert.deepEqual(raw.filter(Boolean), []);
+    assert.equal(ui.stdin.listenerCount("data"), 0);
   });
 
   it("restores the terminal when raw mode setup fails", async () => {
@@ -208,7 +253,7 @@ describe("pool TUI selection", () => {
         pendingRefreshLabel: () => null,
       } as unknown as TuiDeps["pool"],
       accounts: {
-        getAccount: async () => ({}),
+        getAccount: async () => ({ enrolledAt: 0, email: null }),
         removeAccount: async (label: string) => {
           calls.push(`keychain:${label}`);
         },
@@ -279,31 +324,86 @@ describe("pool TUI prune", () => {
     assert.deepEqual([...findRedundant([mine("me", "disabled"), mine("me-2", "disabled", true)])], ["me"]);
   });
 
-  it("prunes the dead entry, never its healthy sibling", async () => {
+  /** Store, rotation state and snapshot all derived from one set of records, like the real pool. */
+  function pool(records: Record<string, { email: string; enrolledAt: number; disabled?: boolean }>) {
     const removed: string[] = [];
-    const accounts = [mine("me-2", "ready"), mine("me", "disabled", true)];
+    const rotation: RotationState = { version: 1, activeLabel: "me", accounts: {} };
+    const sync = () => {
+      for (const [label, r] of Object.entries(records)) {
+        rotation.accounts[label] = { disabled: r.disabled === true, cooldownUntil: null } as AccountState;
+      }
+    };
+    sync();
+    const record = (label: string) => records[label] && { label, ...records[label], oauth: {} };
     const tui = createPoolTui({
       pool: {
-        snapshot: async () => ({ activeLabel: "me", now: 0, accounts }),
+        snapshot: async () => ({
+          activeLabel: rotation.activeLabel, now: 0,
+          accounts: Object.entries(records).map(([label, r]) => ({
+            ...mine(label, r.disabled ? "disabled" : "ready", rotation.activeLabel === label), email: r.email, enrolledAt: r.enrolledAt,
+          })),
+        }),
         pendingRefreshLabel: () => null,
       } as unknown as TuiDeps["pool"],
       accounts: {
-        getAccount: async () => ({}),
+        getAccount: async (label: string) => record(label) ?? null,
+        listAccounts: async () => Object.keys(records).map(record),
         removeAccount: async (label: string) => {
           removed.push(label);
+          delete records[label];
         },
       } as unknown as TuiDeps["accounts"],
-      state: lockedState() as unknown as TuiDeps["state"],
+      state: lockedState(rotation) as unknown as TuiDeps["state"],
       enroll: async () => "",
       stdout: { columns: 100, rows: 30, write: () => true, on: () => undefined } as unknown as NodeJS.WriteStream,
       stdin: {} as NodeJS.ReadStream,
     });
+    return { tui, removed, records, sync };
+  }
 
-    await tui.reload();
-    await tui.onKey("p");
-    await tui.onKey("y");
+  it("prunes the dead entry, never its healthy sibling", async () => {
+    const p = pool({ "me-2": { email: "me@example.com", enrolledAt: 1 }, me: { email: "me@example.com", enrolledAt: 0, disabled: true } });
 
-    assert.deepEqual(removed, ["me"]);
+    await p.tui.reload();
+    await p.tui.onKey("p");
+    await p.tui.onKey("y");
+
+    assert.deepEqual(p.removed, ["me"]);
+  });
+
+  it("does not prune an account replaced after the prompt opened", async () => {
+    const p = pool({ "me-2": { email: "me@example.com", enrolledAt: 1 }, me: { email: "me@example.com", enrolledAt: 0, disabled: true } });
+
+    await p.tui.reload();
+    await p.tui.onKey("p");
+    // Re-enrolled under the same label as a different account while the prompt was up.
+    p.records.me = { email: "other@example.com", enrolledAt: 5 };
+    p.sync();
+    await p.tui.onKey("y");
+
+    assert.deepEqual(p.removed, []);
+  });
+
+  it("does not prune an entry that stopped being redundant", async () => {
+    const p = pool({ "me-2": { email: "me@example.com", enrolledAt: 1 }, me: { email: "me@example.com", enrolledAt: 0, disabled: true } });
+
+    await p.tui.reload();
+    await p.tui.onKey("p");
+    delete p.records["me-2"];
+    await p.tui.onKey("y");
+
+    assert.deepEqual(p.removed, []);
+  });
+
+  it("does not remove an account replaced after the x prompt opened", async () => {
+    const p = pool({ me: { email: "me@example.com", enrolledAt: 0 } });
+
+    await p.tui.reload();
+    await p.tui.onKey("x");
+    p.records.me = { email: "me@example.com", enrolledAt: 5 };
+    await p.tui.onKey("y");
+
+    assert.deepEqual(p.removed, []);
   });
 });
 
@@ -361,7 +461,7 @@ describe("pool TUI enroll", () => {
         pendingRefreshLabel: () => null,
       } as unknown as TuiDeps["pool"],
       accounts: {
-        getAccount: async () => ({}),
+        getAccount: async () => ({ enrolledAt: 0, email: null }),
         removeAccount: async (label: string) => {
           removed.push(label);
         },

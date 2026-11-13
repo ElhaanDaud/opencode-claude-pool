@@ -159,7 +159,7 @@ function durationFromMessage(message: unknown): number | undefined {
     if (typeof message !== "string") return undefined;
 
     const match = message.match(
-      /(?:in|after)?\s*(\d+(?:\.\d+)?)\s*(milliseconds?|ms|seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h|days?|d)\b/i,
+      /\b(?:in|after)\s+(\d+(?:\.\d+)?)\s*(milliseconds?|ms|seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h|days?|d)\b/i,
     );
     if (!match) return undefined;
 
@@ -237,10 +237,12 @@ function resolveBodyHint(bodyText: unknown, now: number): ResetWindow | undefine
       if (typeof error === "object" && error !== null) message = Reflect.get(error, "message");
     }
 
+    // An explicit reset time outranks a duration: a message such as "50
+    // messages per 5h; resets at <time>" names the window's length, not the wait.
     const seconds =
-      durationFromMessage(message) ??
       timestampFromMessage(message, now) ??
-      findResetField(parsed, now);
+      findResetField(parsed, now) ??
+      durationFromMessage(message);
     return seconds === undefined ? undefined : { seconds, source: "body-hint" };
   } catch {
     return undefined;
@@ -398,10 +400,18 @@ function classifyInternal(input: ClassifyInput): RotationDecision {
     if (unifiedStatusRejects(input.headers)) {
       // Cool until the spent window resets: a shorter retry-after would bring
       // the account back early, only to be rejected again. A longer one wins.
+      // A zero wait contradicts the rejection, and would make the account
+      // selectable again at once, so it counts as no reset at all.
+      const positive = (window: ResetWindow | undefined) =>
+        window !== undefined && window.seconds > 0 ? window : undefined;
+      const unified = positive(unifiedReset);
+      const after = positive(retryAfter);
       const cooldown =
-        unifiedReset !== undefined && (retryAfter?.seconds ?? 0) <= unifiedReset.seconds
-          ? unifiedReset
-          : reset;
+        unified !== undefined && (after?.seconds ?? 0) <= unified.seconds
+          ? unified
+          : after ??
+            positive(resolveTokenReset(input.headers, now)) ??
+            positive(resolveBodyHint(input.bodyText, now));
       const durationMs = cooldown
         ? safeDurationMs(cooldown.seconds)
         : DEFAULT_UNKNOWN_COOLDOWN_MS;

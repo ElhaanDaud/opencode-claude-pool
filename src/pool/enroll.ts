@@ -5,6 +5,7 @@ import type {
   AccountRecord,
   ClaudeCliCredentials,
   Clock,
+  RotationState,
 } from "./types.js";
 import type { AccountStore } from "./manager.js";
 import type { RotationStateStore } from "./rotation-state.js";
@@ -296,15 +297,20 @@ export async function enrollFromClaudeCli(
 /**
  * Drop an account's credentials and rotation entry under the rotation lock, so
  * an in-flight refresh cannot write its tokens back after the removal. Returns
- * false when the label is unknown to both.
+ * false when the label is unknown to both, or when `eligible` (checked under
+ * the same lock) rejects it: a label confirmed for removal may since have been
+ * re-enrolled as a different account.
  */
 export async function removeEnrolledAccount(
   accounts: AccountStore,
   state: RotationStateStore,
   label: string,
+  eligible?: (record: AccountRecord | null, rotation: RotationState) => boolean | Promise<boolean>,
 ): Promise<boolean> {
   return state.withLock(async (rotation) => {
-    if (!(await accounts.getAccount(label)) && !Object.hasOwn(rotation.accounts, label)) return false;
+    const record = await accounts.getAccount(label);
+    if (!record && !Object.hasOwn(rotation.accounts, label)) return false;
+    if (eligible && !(await eligible(record, rotation))) return false;
     await accounts.removeAccount(label);
     delete rotation.accounts[label];
     if (rotation.activeLabel === label) rotation.activeLabel = null;
