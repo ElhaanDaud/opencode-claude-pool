@@ -44,7 +44,8 @@ import { translateJsonResponse, translateSseStream } from "./stream.js";
 import { repairToolPairs } from "./history.js";
 import type { HistoryRepairs } from "./history.js";
 import {
-  appendTrace, captureProvenance, capturedBlocksToSend, isTrustedDestination, limitCacheBreakpoints, untrustedDestinationResponse,
+  appendTrace, captureProvenance, capturedBlocksToSend, isTrustedDestination, limitCacheBreakpoints, traceableSetting,
+  untrustedDestinationResponse,
 } from "./request-policy.js";
 import type { ChangeReason, RequestEvent, SettingChange } from "./request-policy.js";
 import { MAX_RESPONSE_RETRIES, MAX_RETRY_DELAY_MS, RETRYABLE_STATUSES, getResponseRetryDelayMs } from "./retry.js";
@@ -878,13 +879,15 @@ export function traceRequest(input: {
     model: sent.model,
     account: input.account,
     settings: {
-      thinking: sent.thinking,
-      output_config: sent.output_config,
-      temperature: sent.temperature,
-      tool_choice: sent.tool_choice,
-      context_management: sent.context_management,
+      thinking: traceableSetting(sent.thinking),
+      output_config: traceableSetting(sent.output_config),
+      temperature: traceableSetting(sent.temperature),
+      tool_choice: traceableSetting(sent.tool_choice),
+      context_management: traceableSetting(sent.context_management),
     },
-    changes: input.prepared?.settingChanges ?? [],
+    changes: (input.prepared?.settingChanges ?? []).map((change) => ({
+      ...change, from: traceableSetting(change.from), to: traceableSetting(change.to),
+    })),
     historyRepairs: input.prepared?.historyRepairs ?? null,
     tools: Array.isArray(sent.tools) ? (sent.tools as Array<{ name?: string }>).map((tool) => tool.name) : [],
     events: input.events ?? [],
@@ -1883,6 +1886,12 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                     freshToken = tokens.access;
                     expires = tokens.expires;
                   } catch (err) {
+                    // The caller stopped waiting: the request ends, not the
+                    // refresh, which still lands in the store.
+                    if (signal?.aborted) {
+                      await response.body?.cancel().catch(() => {});
+                      throw err;
+                    }
                     const detail = err instanceof Error ? err.message : String(err);
                     console.error(`[opencode-claude-bridge] no fresh token after 429, returning it: ${detail}`);
                     events.push({ kind: "credential", reason: "rate-limited", outcome: "failed" });
@@ -1914,11 +1923,11 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                 ? translateToolArgsJsonString(json, name, declaredToolFields[name]) : json,
               debug: (msg: string) => console.error(`[opencode-claude-bridge] stream: ${msg}`),
             };
-            // A successful JSON message is translated as a whole. Every other
-            // success goes through the stream translator, which forwards bytes
-            // that aren't Anthropic events untouched: a mislabelled event
-            // stream must not hand OpenCode Claude's tool names.
-            if (contentType === "application/json") return translateJsonResponse(response, streamDeps);
+            // Only what the bridge understands is rewritten: a JSON message as a
+            // whole, an event stream event by event. Any other body is
+            // returned untouched, byte for byte.
+            if (contentType === "application/json") return await translateJsonResponse(response, streamDeps);
+            if (contentType !== "text/event-stream") return response;
 
             // Tool_use arguments are buffered and translated whole at
             // content_block_stop, since fragments split mid-key (e.g. "file_" +

@@ -41,6 +41,13 @@ export function sourceHash() {
   return hashFiles(root, files);
 }
 
+// Files that change a build without changing a source file.
+const BUILD_INPUTS = ["package.json", "package-lock.json", "tsconfig.json", "tsconfig.build.json", "scripts/build-info.mjs"];
+
+export function inputsHash() {
+  return hashFiles(root, BUILD_INPUTS.map((file) => path.join(root, file)));
+}
+
 export function distHash(directory) {
   return hashFiles(directory, filesIn(directory).filter((file) => file !== path.join(directory, "BUILD-INFO.json")));
 }
@@ -52,7 +59,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
   const info = {
     name: pkg.name, version: pkg.version, commit: git("rev-parse", "HEAD"),
     dirty: Boolean(git("status", "--porcelain", "--untracked-files=normal")),
-    sourceSha256: sourceHash(), distSha256: distHash(path.join(root, "dist")),
+    sourceSha256: sourceHash(), inputsSha256: inputsHash(), distSha256: distHash(path.join(root, "dist")),
     node: process.version, typescript: ts.version, builtAt: new Date().toISOString(),
   };
   writeFileSync(path.join(root, "dist", "BUILD-INFO.json"), `${JSON.stringify(info, null, 2)}\n`);

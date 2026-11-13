@@ -107,6 +107,16 @@ describe("applyClaudeToolsForV2 tool definitions", () => {
     assert.deepEqual(parsed.tools.at(-1), v2Tool("zeta_mcp"));
   });
 
+  it("keeps a 1h cache marker ahead of a 5m one after sorting the tools", () => {
+    const marked = (name: string, ttl: string): Json => ({ ...v2Tool(name), cache_control: { type: "ephemeral", ttl } });
+    const { parsed } = apply([], {
+      tools: [v2Tool("write"), marked("zeta_mcp", "1h"), marked("alpha_mcp", "5m")],
+      system: [{ type: "text", text: "agent", cache_control: { type: "ephemeral" } }],
+    });
+    assert.deepEqual(parsed.tools.map((t: Json) => [t.name, t.cache_control?.ttl ?? null]), [["Write", null], ["alpha_mcp", null], ["zeta_mcp", "1h"]]);
+    assert.deepEqual(parsed.system[0].cache_control, { type: "ephemeral" });
+  });
+
   it("keeps typed tools that have no input_schema", () => {
     const serverTool = { type: "web_search_20250305", name: "web_search" };
     const body = JSON.stringify({ tools: [serverTool, v2Tool("read")] });
@@ -288,7 +298,7 @@ describe("wrapV2Response", () => {
 
   for (const [claude, input, v2, expected] of cases) {
     it(`translates ${claude} ${JSON.stringify(input).slice(0, 40)} to ${v2}`, async () => {
-      const wrapped = wrapV2Response(sse(toolStream(claude, [JSON.stringify(input)])), MAP);
+      const wrapped = await wrapV2Response(sse(toolStream(claude, [JSON.stringify(input)])), MAP);
       assert.deepEqual(await firstToolUse(wrapped), { name: v2, input: expected });
     });
   }
@@ -296,35 +306,36 @@ describe("wrapV2Response", () => {
   it("translates arguments split mid-key across fragments", async () => {
     const json = JSON.stringify({ file_path: "/tmp/a.txt", old_string: "x", new_string: "y" });
     const cut = json.indexOf("file_") + 5;
-    const wrapped = wrapV2Response(sse(toolStream("Edit", [json.slice(0, cut), json.slice(cut, cut + 12), json.slice(cut + 12)])), MAP);
+    const wrapped = await wrapV2Response(sse(toolStream("Edit", [json.slice(0, cut), json.slice(cut, cut + 12), json.slice(cut + 12)])), MAP);
     assert.deepEqual(await firstToolUse(wrapped), { name: "edit", input: { path: "/tmp/a.txt", oldString: "x", newString: "y" } });
   });
 
   it("does not touch a value that merely contains a key name", async () => {
     const input = { file_path: "/a", content: 'file_path="x" old_string' };
-    const wrapped = wrapV2Response(sse(toolStream("Write", [JSON.stringify(input)])), MAP);
+    const wrapped = await wrapV2Response(sse(toolStream("Write", [JSON.stringify(input)])), MAP);
     assert.deepEqual((await firstToolUse(wrapped)).input, { path: "/a", content: 'file_path="x" old_string' });
   });
 
   it("passes unmapped tool calls through", async () => {
-    const wrapped = wrapV2Response(sse(toolStream("patch", ['{"patchText":"x"}'])), MAP);
+    const wrapped = await wrapV2Response(sse(toolStream("patch", ['{"patchText":"x"}'])), MAP);
     assert.deepEqual(await firstToolUse(wrapped), { name: "patch", input: { patchText: "x" } });
   });
 
-  it("returns errors and an empty map untouched, and non-event bodies byte for byte", async () => {
+  it("returns errors, an empty map and bodies that are neither events nor JSON untouched", async () => {
     const error = new Response("{}", { status: 429, headers: { "content-type": "text/event-stream" } });
-    assert.equal(wrapV2Response(error, MAP), error);
-    const plain = '{"name":"Bash"}\n\nnot an event';
-    const text = new Response(plain, { status: 200, headers: { "content-type": "text/plain" } });
-    assert.equal(await wrapV2Response(text, MAP).text(), plain);
+    assert.equal(await wrapV2Response(error, MAP), error);
+    const text = new Response(new Uint8Array([97, 13, 10, 255]), { status: 200, headers: { "content-type": "text/plain" } });
+    const wrapped = await wrapV2Response(text, MAP);
+    assert.equal(wrapped, text);
+    assert.deepEqual([...new Uint8Array(await wrapped.arrayBuffer())], [97, 13, 10, 255]);
     const stream = sse("x");
-    assert.equal(wrapV2Response(stream, {}), stream);
+    assert.equal(await wrapV2Response(stream, {}), stream);
   });
 
   it("translates successful JSON messages using the V2 tool mapping", async () => {
     const message = { type: "message", content: [{ type: "text", text: '"name":"Bash" mcp_Foo' }, { type: "tool_use", name: "Write", input: { file_path: "/x", content: '"name":"Bash" mcp_Foo' } }] };
     const response = new Response(JSON.stringify(message), { headers: { "content-type": "application/json", "content-length": "123", "x-test": "ok" } });
-    const wrapped = wrapV2Response(response, MAP);
+    const wrapped = await wrapV2Response(response, MAP);
     assert.equal(wrapped.headers.get("content-length"), null);
     assert.equal(wrapped.headers.get("x-test"), "ok");
     assert.deepEqual(await wrapped.json(), { type: "message", content: [message.content[0], { type: "tool_use", name: "write", input: { path: "/x", content: '"name":"Bash" mcp_Foo' } }] });
@@ -332,13 +343,13 @@ describe("wrapV2Response", () => {
 
   it("passes malformed JSON and error responses unchanged", async () => {
     const malformed = new Response("{bad", { headers: { "content-type": "application/json" } });
-    assert.equal(await wrapV2Response(malformed, MAP).text(), "{bad");
+    assert.equal(await (await wrapV2Response(malformed, MAP)).text(), "{bad");
     const error = new Response("{bad", { status: 400, headers: { "content-type": "application/json" } });
-    assert.equal(wrapV2Response(error, MAP), error);
+    assert.equal(await wrapV2Response(error, MAP), error);
   });
 
-  it("keeps status and headers on a wrapped response", () => {
-    const wrapped = wrapV2Response(sse(toolStream("Read", ["{}"]), { "content-type": "text/event-stream", "x-test": "1" }), MAP);
+  it("keeps status and headers on a wrapped response", async () => {
+    const wrapped = await wrapV2Response(sse(toolStream("Read", ["{}"]), { "content-type": "text/event-stream", "x-test": "1" }), MAP);
     assert.equal(wrapped.status, 200);
     assert.equal(wrapped.headers.get("x-test"), "1");
   });

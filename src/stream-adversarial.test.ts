@@ -131,8 +131,35 @@ it("bounds nonstreaming JSON and leaves malformed bodies unchanged", async () =>
   assert.equal(translateJsonMessage("{bad", { ...deps, debug: (s) => logs.push(s) }), "{bad");
   assert.equal(logs.length, 1);
   const response = new Response("x".repeat(16 * 1024 * 1024 + 1), { headers: { "content-type": "application/json" } });
-  const result = await translateJsonResponse(response, deps).json() as { type: string; error: { message: string } };
+  const limited = await translateJsonResponse(response, deps);
+  // A success status would hand the host an error envelope as if it were a message.
+  assert.equal(limited.ok, false);
+  assert.equal(limited.status, 502);
+  const result = await limited.json() as { type: string; error: { message: string } };
   assert.equal(result.type, "error");
   assert.match(result.error.message, /limit/);
   assert.doesNotMatch(result.error.message, /xxxxxxxx/);
+});
+
+it("fails explicitly when tool input buffered across open calls exceeds the aggregate limit", () => {
+  const p = createSseProcessor(deps);
+  const sixMiB = "y".repeat(6 * 1024 * 1024);
+  const output = p.feedChunk(start(1) + delta(1, sixMiB) + start(2) + delta(2, sixMiB) + start(3) + delta(3, sixMiB));
+  assert.match(output, /event: error/);
+  assert.match(output, /buffered/i);
+  assert.doesNotMatch(output, /yyyyyyyy/);
+});
+
+it("fails explicitly when too many tool calls are open at once", () => {
+  const p = createSseProcessor(deps);
+  const output = p.feedChunk(Array.from({ length: 33 }, (_, i) => start(i) + delta(i, "secret")).join(""));
+  assert.match(output, /event: error/);
+  assert.doesNotMatch(output, /secret/);
+});
+
+it("passes a JSON body it does not translate through with its exact bytes", async () => {
+  const bytes = [123, 98, 97, 100, 13, 10, 255];
+  const response = new Response(new Uint8Array(bytes), { headers: { "content-type": "application/json" } });
+  const translated = await translateJsonResponse(response, deps);
+  assert.deepEqual([...new Uint8Array(await translated.arrayBuffer())], bytes);
 });

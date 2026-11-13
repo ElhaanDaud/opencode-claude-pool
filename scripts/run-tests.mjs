@@ -8,7 +8,7 @@ const manifest = {
   "api-key.test.js": "fixture", "history.test.js": "fixture", "index.test.js": "fixture",
   "opencode2/tools.test.js": "fixture", "pool/classifier-live.test.js": "fixture",
   "pool/classifier.test.js": "fixture", "pool/selection.test.js": "fixture",
-  "stream-adversarial.test.js": "fixture", "stream.test.js": "fixture",
+  "stream-adversarial.test.js": "fixture", "stream.test.js": "fixture", "validator-redaction.test.js": "fixture",
   "keychain.test.js": "injected-boundary", "opencode2/server.test.js": "injected-boundary",
   "opencode2/shared.test.js": "injected-boundary", "opencode2/tui.test.js": "injected-boundary",
   "pool/bridge.test.js": "injected-boundary", "pool/enroll.test.js": "injected-boundary",
@@ -16,7 +16,7 @@ const manifest = {
   "pool/security-fixes.test.js": "injected-boundary", "pool/secret-store.test.js": "injected-boundary",
   "pool/tui.test.js": "injected-boundary", "rotation-loop.test.js": "injected-boundary",
   "single-account.test.js": "injected-boundary", "tool-contracts.test.js": "injected-boundary",
-  "oauth.test.js": "process", "pool/rotation-state.test.js": "process",
+  "build-info.test.js": "process", "oauth.test.js": "process", "pool/rotation-state.test.js": "process",
   "single-account-coordinator.test.js": "process", "pool/process-faults.test.js": "process",
 };
 const nativeFile = "pool/secret-store.test.js";

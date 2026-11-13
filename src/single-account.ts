@@ -185,9 +185,10 @@ export function createSingleAccount(opts: SingleAccountOptions) {
     return bridgeOwned().includes(fingerprint(refresh)) ? "bridge" : "claude-cli";
   }
 
-  function recordBridgeOwned(refresh: string): void {
-    const hash = fingerprint(refresh);
-    const owned = [hash, ...bridgeOwned().filter((other) => other !== hash)].slice(0, OWNED_HISTORY);
+  /** `kept`, the stored chain a failed save leaves in place, stays recorded beside the new one. */
+  function recordBridgeOwned(refresh: string, kept?: string): void {
+    const hashes = (kept === undefined ? [refresh] : [refresh, kept]).map(fingerprint);
+    const owned = [...new Set([...hashes, ...bridgeOwned()])].slice(0, OWNED_HISTORY);
     writeDurably(ownersPath(), JSON.stringify({ bridge: owned }));
   }
 
@@ -319,7 +320,9 @@ export function createSingleAccount(opts: SingleAccountOptions) {
           "The Claude login was removed or switched to an API key while it was being refreshed, so the refreshed tokens were not saved over it.",
         );
       }
-      return usable(after) ? after : fresh;
+      if (usable(after)) return after;
+      // Not `fresh`: that is the login just replaced. The retry takes the new one as its owner requires.
+      throw new CredentialBusyError("The Claude login was replaced while it was being refreshed; retrying with the new login.");
     }
 
     try {
@@ -389,11 +392,23 @@ export function createSingleAccount(opts: SingleAccountOptions) {
       return fresh;
     },
 
-    /** Save a new login with its owner. Recorded before saving, so it is never taken for a copy. */
+    /**
+     * Save a new login with its owner. OpenCode's own is recorded before saving,
+     * so it is never taken for a copy; a failed save leaves the stored login's owner as it was.
+     */
     async recordLogin(tokens: OAuthTokens, owner: Owner): Promise<void> {
       await locked(async () => {
-        if (owner === "bridge") recordBridgeOwned(tokens.refresh);
-        else fs.rmSync(ownersPath(), { force: true });
+        if (owner === "claude-cli") {
+          await opts.save(tokens);
+          try {
+            fs.rmSync(ownersPath(), { force: true });
+          } catch (err) {
+            console.error(`[opencode-claude-bridge] could not clear the record of OpenCode's own logins: ${firstLine(err)}`);
+          }
+          return;
+        }
+        const stored = asTokens(await opts.getAuth());
+        recordBridgeOwned(tokens.refresh, stored && ownerOf(stored.refresh) === "bridge" ? stored.refresh : undefined);
         await opts.save(tokens);
       });
     },

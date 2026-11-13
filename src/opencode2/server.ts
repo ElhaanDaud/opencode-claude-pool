@@ -528,7 +528,7 @@ async function setup(ctx: V2Context): Promise<() => void> {
     }
 
     if (entry.kind === "single") {
-      event.response = wrapV2Response(event.response, entry.inboundToolNameMap);
+      event.response = await wrapV2Response(event.response, entry.inboundToolNameMap);
       return;
     }
 
@@ -566,7 +566,7 @@ async function setup(ctx: V2Context): Promise<() => void> {
       settled = failed;
     }
     if (failed && settled !== failed) await failed.body?.cancel();
-    event.response = wrapV2Response(exhausted ? await markExhausted(settled) : settled, inboundToolNameMap);
+    event.response = await wrapV2Response(exhausted ? await markExhausted(settled) : settled, inboundToolNameMap);
   };
 
   // V2 retries a 429 by default; an exhausted pool only recovers when an

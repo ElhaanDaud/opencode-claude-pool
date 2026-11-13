@@ -470,7 +470,7 @@ describe("request body rewrite", () => {
       { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: JSON.stringify(args) } },
       { type: "content_block_stop", index: 0 },
     ].map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join("");
-    const { sent, text } = await send([{ status: 200, body: events }], {
+    const { sent, text } = await send([{ status: 200, body: events, headers: { "content-type": "text/event-stream" } }], {
       ...plain, tools: [{ name: "Read", input_schema: { type: "object" } }],
       messages: [{ role: "assistant", content: [{ type: "tool_use", id: "t", name: "Read", input: args }] }],
     });
@@ -534,7 +534,7 @@ describe("request body rewrite", () => {
       { type: "tool_use", id: "b", name: "skill", input: { name: "git-master", user_message: "amend" } },
     ];
 
-    const { sent, text } = await send([{ status: 200, body: events }], {
+    const { sent, text } = await send([{ status: 200, body: events, headers: { "content-type": "text/event-stream" } }], {
       ...plain, tools: [task, skill, grep],
       messages: [{ role: "assistant", content: history }],
     });
@@ -871,6 +871,71 @@ describe("retry and deadline accounting", () => {
       assert.equal((await call(fetcher)).status, 200);
       assert.equal((await call(fetcher)).status, 200);
       assert.equal(warnings.filter((w) => w.includes("could not write the request trace")).length, 1);
+    } finally {
+      delete process.env.ANTHROPIC_TRACE_PATH;
+    }
+  });
+});
+
+describe("review findings 27-45", () => {
+  async function loadedFor(store: { auth: StoredAuth }) {
+    const hooks = await plugin.server({ client: { auth: { set: async ({ body }: { body: Record<string, unknown> }) => { store.auth = body as StoredAuth; } } } });
+    return await hooks.auth.loader(async () => ({ ...store.auth }), { models: {} }) as { fetch: typeof fetch };
+  }
+
+  it("rejects when cancelled while a 429 waits for a fresh token, and still saves that refresh", async () => {
+    liveRefreshTokens.add("rl-refresh");
+    ownedByBridge("rl-refresh");
+    // Usable when the request starts, within a minute of expiry once the 429 arrives.
+    const store = { auth: { type: "oauth", access: "rl", refresh: "rl-refresh", expires: Date.now() + 61_000 } };
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      if (!String(url).includes("/v1/messages")) return new Response("{}", { status: 404 });
+      await new Promise((resolve) => setTimeout(resolve, 1_200));
+      return new Response('{"type":"error"}', { status: 429, headers: { "retry-after": "0" } });
+    }) as typeof fetch;
+    const loaded = await loadedFor(store);
+    tokenDelayMs = 400;
+    try {
+      const controller = new AbortController();
+      const request = loaded.fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST", body: JSON.stringify(plain), signal: controller.signal,
+      });
+      setTimeout(() => controller.abort(new Error("cancelled")), 1_400);
+      await assert.rejects(request, /cancelled/);
+      for (let i = 0; i < 40 && store.auth.refresh !== "rl-refresh/next"; i++) await new Promise((resolve) => setTimeout(resolve, 50));
+      assert.equal(store.auth.refresh, "rl-refresh/next");
+    } finally {
+      tokenDelayMs = 0;
+    }
+  });
+
+  it("returns a success that is neither an event stream nor JSON byte for byte", async () => {
+    const bytes = [97, 13, 10, 255];
+    globalThis.fetch = (async (url: string | URL | Request) => String(url).includes("/v1/messages")
+      ? new Response(new Uint8Array(bytes), { status: 200, headers: { "content-type": "text/plain" } })
+      : new Response("{}", { status: 404 })) as typeof fetch;
+    const loaded = await loadedFor({ auth: { type: "oauth", access: "token", refresh: "refresh", expires: Date.now() + 3_600_000 } });
+    const response = await loaded.fetch("https://api.anthropic.com/v1/messages", { method: "POST", body: JSON.stringify(plain) });
+    assert.deepEqual([...new Uint8Array(await response.arrayBuffer())], bytes);
+  });
+
+  it("traces only the kind of each setting, never schemas or other content of the request", async () => {
+    const trace = path.join(home, "trace.jsonl");
+    process.env.ANTHROPIC_TRACE_PATH = trace;
+    try {
+      const secret = "PRIVATE-SCHEMA-4817";
+      await send([OK], {
+        ...plain,
+        model: "claude-sonnet-5-5",
+        thinking: { type: "disabled" },
+        output_config: { effort: "high", format: { type: "json_schema", schema: { type: "string", enum: [secret] } } },
+      });
+      const written = fs.readFileSync(trace, "utf8");
+      assert.doesNotMatch(written, new RegExp(secret));
+      const [line] = written.trim().split("\n").map((text) => JSON.parse(text));
+      assert.equal(line.settings.output_config.effort, "high");
+      assert.equal(line.settings.thinking.type, "between_tools");
+      assert.ok(line.changes.some((change: { setting: string }) => change.setting === "thinking/output_config"));
     } finally {
       delete process.env.ANTHROPIC_TRACE_PATH;
     }

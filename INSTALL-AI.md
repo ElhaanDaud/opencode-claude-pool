@@ -68,17 +68,21 @@ git -C ~/src/opencode-claude-bridge pull --ff-only
 Then build and test:
 
 ```bash
-cd ~/src/opencode-claude-bridge && npm ci --ignore-scripts && npm run build && npm test
+cd ~/src/opencode-claude-bridge && node scripts/install-deps.mjs && npm run build && npm test
 ```
 
 All tests must pass before you continue.
 
 ## 4. Register the plugin
 
-Back up the config first if it exists:
+Back up the config files that exist first, under a dated name so a later run
+never overwrites an earlier backup:
 
 ```bash
-cp ~/.config/opencode/opencode.json ~/.config/opencode/opencode.json.bak
+stamp=$(date +%Y%m%d-%H%M%S)
+for f in ~/.config/opencode/opencode.json ~/.config/opencode/opencode.jsonc; do
+  if [ -f "$f" ]; then cp "$f" "$f.bak-$stamp"; fi
+done
 ```
 
 The file may be JSONC (comments allowed). Edit it in place, and use the user's
@@ -122,13 +126,16 @@ load the wrapper.
 
 ## 5. Install the claude-pool command
 
-This appends a shell function to the user's shell rc file. Ask before running it.
+This appends the hook (a `claude-pool` function and a `claude` wrapper, between
+`# >>> claude-pool hook >>>` and `# <<< claude-pool hook <<<` lines) to the
+user's shell rc file. Ask before running it. The `grep` skips it when it is
+already there:
 
 ```bash
 # zsh
-node ~/src/opencode-claude-bridge/scripts/claude-pool.mjs install-hook >> ~/.zshrc
+grep -q '^# >>> claude-pool hook >>>$' ~/.zshrc 2>/dev/null || node ~/src/opencode-claude-bridge/scripts/claude-pool.mjs install-hook >> ~/.zshrc
 # bash
-node ~/src/opencode-claude-bridge/scripts/claude-pool.mjs install-hook >> ~/.bashrc
+grep -q '^# >>> claude-pool hook >>>$' ~/.bashrc 2>/dev/null || node ~/src/opencode-claude-bridge/scripts/claude-pool.mjs install-hook >> ~/.bashrc
 ```
 
 Until the user opens a new shell, call it as

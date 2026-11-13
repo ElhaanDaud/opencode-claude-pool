@@ -260,6 +260,82 @@ describe("single-account coordinator", () => {
     assert.deepEqual(endpoint.exchanges, ["j0", "j0+"]);
   });
 
+  it("never serves the login it refreshed once a replacement that can't be used yet is stored", async (t) => {
+    const { dir, store, own } = setup(t, { type: "oauth", access: "a", refresh: "swap-r", expires: 0 });
+    own("swap-r");
+    const replacement = { type: "oauth", access: "swap-new", refresh: "swap-new-r", expires: Date.now() - 1000 };
+    const account = createSingleAccount({
+      getAuth: async () => store.auth,
+      save: async (tokens) => { store.auth = { type: "oauth", ...tokens }; },
+      readCli: () => null,
+      refresh: async () => {
+        store.auth = replacement;
+        return { access: "swap-fresh", refresh: "swap-fresh-r", expires: Date.now() + HOUR };
+      },
+      withLock: direct,
+      dir,
+    });
+    await assert.rejects(account.tokens(store.auth), CredentialBusyError);
+    assert.deepEqual(store.auth, replacement);
+    assert.deepEqual(asideIn(dir), ["swap-fresh-r"]);
+    // The retry starts from the replacement: not OpenCode's own, expired, and no Claude Code login to follow.
+    await assert.rejects(account.tokens(store.auth), CredentialUnavailableError);
+  });
+
+  it("keeps the stored login OpenCode's own when saving Claude Code's login fails", async (t) => {
+    const { dir, store } = setup(t, {});
+    const endpoint = tokenEndpoint("cli-fail-r");
+    const cli: OAuthTokens = { access: "cli-fail-claude", refresh: "cli-fail-claude-r", expires: Date.now() + HOUR };
+    let storageUp = true;
+    const account = createSingleAccount({
+      getAuth: async () => store.auth,
+      save: async (tokens) => {
+        if (!storageUp) throw new Error("storage unavailable");
+        store.auth = { type: "oauth", ...tokens };
+      },
+      readCli: () => cli,
+      refresh: endpoint.refresh,
+      withLock: direct,
+      dir,
+    });
+    await account.recordLogin({ access: "cli-fail/access", refresh: "cli-fail-r", expires: 0 }, "bridge");
+    storageUp = false;
+    await assert.rejects(account.recordLogin(cli, "claude-cli"), /storage unavailable/);
+    storageUp = true;
+    assert.equal(store.auth?.refresh, "cli-fail-r");
+    assert.equal(account.ownerOf("cli-fail-r"), "bridge");
+    // Expired: refreshed as OpenCode's own, not replaced by Claude Code's login.
+    assert.equal((await account.tokens(store.auth)).refresh, "cli-fail-r+");
+    assert.deepEqual(endpoint.exchanges, ["cli-fail-r"]);
+
+    await account.recordLogin(cli, "claude-cli");
+    assert.equal(store.auth?.refresh, "cli-fail-claude-r");
+    assert.equal(account.ownerOf("cli-fail-r+"), "claude-cli");
+  });
+
+  it("keeps the stored login OpenCode's own across sign-ins whose save fails", async (t) => {
+    const { dir, store } = setup(t, {});
+    let storageUp = true;
+    const account = createSingleAccount({
+      getAuth: async () => store.auth,
+      save: async (tokens) => {
+        if (!storageUp) throw new Error("storage unavailable");
+        store.auth = { type: "oauth", ...tokens };
+      },
+      readCli: () => null,
+      refresh: async () => { throw new Error("unused"); },
+      withLock: direct,
+      dir,
+    });
+    await account.recordLogin({ access: "kept/access", refresh: "kept-r", expires: Date.now() + HOUR }, "bridge");
+    storageUp = false;
+    for (const n of [1, 2]) {
+      await assert.rejects(account.recordLogin({ access: `retry${n}/access`, refresh: `retry${n}-r`, expires: Date.now() + HOUR }, "bridge"));
+    }
+    assert.equal(store.auth?.refresh, "kept-r");
+    assert.equal(account.ownerOf("kept-r"), "bridge");
+  });
+
   /** Two real processes refresh one expired login at the same moment. */
   async function race(t: TestContext, locked: boolean): Promise<{ exchanges: string[]; results: string[] }> {
     const { dir, own } = setup(t, {});

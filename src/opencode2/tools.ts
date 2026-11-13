@@ -15,6 +15,7 @@ import {
   getClaudeTools,
 } from "../claude-tools.js";
 import type { ToolDefinition } from "../claude-tools.js";
+import { limitCacheBreakpoints } from "../request-policy.js";
 import { translateJsonResponse, translateSseStream } from "../stream.js";
 
 type Json = Record<string, unknown>;
@@ -325,6 +326,8 @@ export function applyClaudeToolsForV2(body: string): { body: string; inboundTool
     if (mapping) parsed.tool_choice.name = mapping.claude;
   }
 
+  // prepareRequest checked the markers before this sort, which can put a 5m one ahead of a 1h one.
+  limitCacheBreakpoints(parsed);
   const inboundToolNameMap: Record<string, string> = {};
   for (const mapping of active.values()) inboundToolNameMap[mapping.claude] = mapping.v2;
   return { body: JSON.stringify(parsed), inboundToolNameMap };
@@ -347,10 +350,11 @@ function translateStreamedArgs(json: string, claudeName: string): string {
 }
 
 /**
- * Rewrite Claude tool names and arguments in SSE or JSON responses back to V2's.
- * Errors and other bodies pass through untouched.
+ * Rewrite Claude tool names and arguments back to V2's, in an event stream or
+ * a JSON message. Anything else (errors, other media types) passes through
+ * untouched, byte for byte.
  */
-export function wrapV2Response(response: Response, inboundToolNameMap: Record<string, string>): Response {
+export async function wrapV2Response(response: Response, inboundToolNameMap: Record<string, string>): Promise<Response> {
   if (!response.body || !response.ok || Object.keys(inboundToolNameMap).length === 0) return response;
   const contentType = (response.headers.get("content-type") ?? "").split(";")[0].trim().toLowerCase();
   // Only translate calls to tools that were swapped in this request.
@@ -361,9 +365,8 @@ export function wrapV2Response(response: Response, inboundToolNameMap: Record<st
     translateToolArgs,
     debug: (msg: string) => console.error(`[opencode-claude-bridge] stream: ${msg}`),
   };
-  // As in V1: JSON is translated whole; any other success goes through the
-  // stream translator, which forwards non-event bytes untouched.
   if (contentType === "application/json") return translateJsonResponse(response, deps);
+  if (contentType !== "text/event-stream") return response;
   return new Response(
     translateSseStream(response.body, deps),
     { status: response.status, statusText: response.statusText, headers: response.headers },

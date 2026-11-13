@@ -348,6 +348,34 @@ describe("prompt-cache markers", () => {
     assert.deepEqual(parsed.system[0]!.cache_control, marker);
     assert.equal(changes[0]?.reason, "compatibility");
   });
+
+  it("counts a top-level cache_control (automatic caching) as one of the four", () => {
+    const parsed = {
+      cache_control: marker,
+      system: [{ type: "text", text: "a", cache_control: marker }, { type: "text", text: "b", cache_control: marker }],
+      messages: [1, 2].map((n) => ({ role: "user", content: [{ type: "text", text: `m${n}`, cache_control: marker }] })),
+    };
+    const changes = limitCacheBreakpoints(parsed);
+    assert.equal("cache_control" in parsed.messages[0]!.content[0]!, false);
+    assert.deepEqual(parsed.messages[1]!.content[0]!.cache_control, marker);
+    assert.deepEqual(parsed.cache_control, marker);
+    assert.deepEqual([changes[0]?.from, changes[0]?.to], ["5 markers", "4 markers"]);
+  });
+
+  it("drops a 5m marker ahead of a 1h one, which the API rejects", () => {
+    const hour = { type: "ephemeral", ttl: "1h" };
+    const parsed = {
+      tools: [{ name: "alpha", cache_control: marker }, { name: "zeta", cache_control: hour }],
+      system: [{ type: "text", text: "agent", cache_control: marker }],
+      messages: [{ role: "user", content: [{ type: "text", text: "tail", cache_control: marker }] }],
+    };
+    const changes = limitCacheBreakpoints(parsed);
+    assert.deepEqual(parsed.tools.map((tool) => "cache_control" in tool), [false, true]);
+    assert.deepEqual(parsed.system[0]!.cache_control, marker);
+    assert.deepEqual(parsed.messages[0]!.content[0]!.cache_control, marker);
+    assert.equal(changes.length, 1);
+    assert.match(changes[0]!.note!, /1h markers before 5m ones; dropped 1 5m marker$/);
+  });
 });
 
 describe("captured Claude Code prompt", () => {

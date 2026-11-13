@@ -34,7 +34,7 @@ account enrolled the pool works but has nowhere to rotate to.
 ```bash
 git clone https://github.com/ElhaanDaud/opencode-claude-pool.git ~/src/opencode-claude-bridge
 cd ~/src/opencode-claude-bridge
-npm ci --ignore-scripts
+node scripts/install-deps.mjs   # npm ci, isolated from your npm config, credentials and cache
 npm run build
 ```
 
@@ -146,13 +146,17 @@ hook described in the next section):
 
 ```bash
 # zsh
-node ~/src/opencode-claude-bridge/scripts/claude-pool.mjs install-hook >> ~/.zshrc && source ~/.zshrc
+grep -q '^# >>> claude-pool hook >>>$' ~/.zshrc 2>/dev/null || node ~/src/opencode-claude-bridge/scripts/claude-pool.mjs install-hook >> ~/.zshrc
+source ~/.zshrc
 # bash — the default on most Linux distros
-node ~/src/opencode-claude-bridge/scripts/claude-pool.mjs install-hook >> ~/.bashrc && source ~/.bashrc
+grep -q '^# >>> claude-pool hook >>>$' ~/.bashrc 2>/dev/null || node ~/src/opencode-claude-bridge/scripts/claude-pool.mjs install-hook >> ~/.bashrc
+source ~/.bashrc
 ```
 
 That defines a `claude-pool` shell function and wraps `claude`, so the full
-path is only needed this once.
+path is only needed this once. The hook sits between `# >>> claude-pool hook >>>`
+and `# <<< claude-pool hook <<<` lines; the `grep` keeps a second run from
+adding it twice.
 
 Then:
 
@@ -238,15 +242,16 @@ Check which account served it:
 claude-pool status
 ```
 
-Optionally run the full end-to-end scenarios. The first hits the real API; the
-rest use a local upstream to simulate rate limits, and the harness restores your
-live rotation state on exit:
+Optionally run the full end-to-end scenarios. This is a live tool: it uses your
+real pool accounts and may refresh their tokens, and the first scenario sends a
+real request; the rest use a local upstream to simulate rate limits. It runs
+only with `--live`:
 
 ```bash
 cd ~/src/opencode-claude-bridge
-node scripts/qa-rotation.mjs
+node scripts/qa-rotation.mjs --live
 # expected: 10/10 scenarios passed
-node scripts/qa-rotation.mjs s3   # run one scenario (s1–s10)
+node scripts/qa-rotation.mjs --live s3   # run one scenario (s1–s10)
 ```
 
 ---
@@ -364,7 +369,7 @@ when the variable is set, the bridge reads
 ```bash
 cd ~/src/opencode-claude-bridge
 git pull
-npm ci --ignore-scripts && npm run build
+node scripts/install-deps.mjs && npm run build
 ```
 
 Restart OpenCode. Enrolled accounts survive upgrades — they live in the
@@ -375,25 +380,42 @@ not in the repo.
 
 ## 9. Uninstalling
 
+Do these in order: nothing may refresh a token while its files are removed.
+
 ```bash
-# Remove enrolled accounts
-claude-pool dashboard            # shows the labels
-claude-pool remove <label>        # repeat per account
+# 1. Quit OpenCode, every window.
 
-# Remove rotation state
+# 2. Unregister the plugin: delete the claude-bridge-wrapper.mjs entry from the
+#    "plugin" list (OpenCode 1) and the dist/opencode2 entry from "plugins"
+#    (OpenCode 2) in ~/.config/opencode/opencode.json[c], or restore a
+#    backup you made before installing; then
+rm -f ~/.config/opencode/claude-bridge-wrapper.mjs
+
+# 3. Remove the shell hook (keeps a .bak copy of the rc file)
+sed -i.bak '/^# >>> claude-pool hook >>>$/,/^# <<< claude-pool hook <<<$/d' ~/.zshrc   # or ~/.bashrc
+
+# 4. Remove enrolled accounts
+node ~/src/opencode-claude-bridge/scripts/claude-pool.mjs dashboard   # shows the labels
+node ~/src/opencode-claude-bridge/scripts/claude-pool.mjs remove <label>   # repeat per account
+
+# 5. Remove rotation state, locks and journals
 rm -rf ~/.local/share/opencode-claude-bridge
-
-# Unregister the plugin: delete the wrapper entry from opencode.json, then
-rm ~/.config/opencode/claude-bridge-wrapper.mjs
 ```
 
-**(Linux)** the `rm -rf` above already removes the pool: enrolled accounts
-live inside `~/.local/share/opencode-claude-bridge/accounts/`. On macOS they
-live in the Keychain, which is why the `claude-pool remove` step matters there.
+A hook installed by an earlier version has no marker lines: delete its
+`claude-pool` and `claude` functions, and the comment lines above them, by hand.
+
+Before step 5, check `~/.local/share/opencode-claude-bridge/` for
+`*.stale` and `*journal*.json` files: they can hold the only live refresh token
+of a login. Delete them only once you no longer need that login.
+
+**(Linux)** step 5 also removes the pool: enrolled accounts live inside
+`~/.local/share/opencode-claude-bridge/accounts/`. On macOS they live in the
+Keychain, which is why step 4 matters there.
 
 Removing accounts from the pool does **not** log you out of Claude. The Claude
 CLI keeps its own credential, and `~/.local/share/opencode/auth.json` keeps
-whichever account was last mirrored — delete its `anthropic` entry if you want
+whichever login OpenCode last used — run `opencode auth logout` if you want
 OpenCode to forget it too.
 
 ---

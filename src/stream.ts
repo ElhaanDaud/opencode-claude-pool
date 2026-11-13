@@ -84,6 +84,13 @@ export type StreamProcessorDeps = {
 export const MAX_TOOL_INPUT_BYTES = 16 * 1024 * 1024;
 export const MAX_SSE_FRAME_BYTES = 16 * 1024 * 1024;
 export const MAX_JSON_MESSAGE_BYTES = 16 * 1024 * 1024;
+// Anthropic streams one content block at a time, so more than one open tool
+// call only comes from a malformed upstream; these bound what it can make us hold.
+export const MAX_BUFFERED_TOOL_BYTES = 16 * 1024 * 1024;
+export const MAX_OPEN_TOOL_BLOCKS = 32;
+
+/** A response over one of the limits above; reported, never truncated. */
+export class ResponseLimitError extends Error {}
 
 const byteLength = (text: string) => Buffer.byteLength(text, "utf8");
 const safeToolName = (name: string) => /^[a-zA-Z0-9_.-]{1,128}$/.test(name) ? name : "unknown";
@@ -107,6 +114,7 @@ function errorEvent(message: string): string {
 export function createSseProcessor(deps: StreamProcessorDeps) {
   type ToolBlockState = { toolName: string; partialJson: string; bytes: number };
   const toolBlocks = new Map<number, ToolBlockState>();
+  let bufferedBytes = 0;
   let sseBuffer = "";
   // The last chunk ended in "\r", so a leading "\n" completes that CRLF.
   let afterCR = false;
@@ -116,6 +124,7 @@ export function createSseProcessor(deps: StreamProcessorDeps) {
     failed = true;
     sseBuffer = "";
     toolBlocks.clear();
+    bufferedBytes = 0;
     return errorEvent(message);
   }
 
@@ -171,6 +180,7 @@ export function createSseProcessor(deps: StreamProcessorDeps) {
       const idx = rec.index as number;
       const claudeName: string = rec.content_block.name || "";
       if (!Number.isSafeInteger(idx) || idx < 0) return fail(`Invalid tool index for ${safeToolName(claudeName)}`);
+      if (toolBlocks.size >= MAX_OPEN_TOOL_BLOCKS) return fail(`Open tool call limit ${MAX_OPEN_TOOL_BLOCKS} exceeded at ${safeToolName(claudeName)}`);
       const mapped = deps.inboundToolNameMap[claudeName] || claudeName;
       rec.content_block.name = mapped;
       if (rec.content_block.input === undefined) rec.content_block.input = {};
@@ -190,9 +200,14 @@ export function createSseProcessor(deps: StreamProcessorDeps) {
       const state = toolBlocks.get(idx);
       if (state) {
         const fragment = String(rec.delta.partial_json ?? "");
-        const size = state.bytes + byteLength(fragment);
+        const fragmentBytes = byteLength(fragment);
+        const size = state.bytes + fragmentBytes;
         if (size > MAX_TOOL_INPUT_BYTES) return fail(`Tool input limit ${MAX_TOOL_INPUT_BYTES} bytes exceeded: ${size} bytes for ${safeToolName(state.toolName)}`);
+        if (bufferedBytes + fragmentBytes > MAX_BUFFERED_TOOL_BYTES) {
+          return fail(`Buffered tool input limit ${MAX_BUFFERED_TOOL_BYTES} bytes exceeded across ${toolBlocks.size} open tool calls`);
+        }
         state.bytes = size;
+        bufferedBytes += fragmentBytes;
         state.partialJson += fragment;
         return "";
       }
@@ -207,6 +222,7 @@ export function createSseProcessor(deps: StreamProcessorDeps) {
       const state = toolBlocks.get(idx);
       if (state) {
         toolBlocks.delete(idx);
+        bufferedBytes -= state.bytes;
         let translated: string;
         try {
           translated = deps.translateToolArgs(state.partialJson, state.toolName);
@@ -281,72 +297,95 @@ export function createSseProcessor(deps: StreamProcessorDeps) {
     sseBuffer = "";
     afterCR = false;
     toolBlocks.clear();
+    bufferedBytes = 0;
   }
 
   return { feedChunk, flush, discard, pendingToolBlocks: () => toolBlocks.size, failed: () => failed };
 }
 
+/**
+ * Translate a complete JSON message's tool calls. A body that isn't a message
+ * comes back as it is; one over a limit throws ResponseLimitError.
+ */
 export function translateJsonMessage(body: string, deps: StreamProcessorDeps): string {
   if (byteLength(body) > MAX_JSON_MESSAGE_BYTES) {
-    return JSON.stringify({ type: "error", error: { type: "api_error", message: `JSON message limit ${MAX_JSON_MESSAGE_BYTES} bytes exceeded` } });
+    throw new ResponseLimitError(`JSON message limit ${MAX_JSON_MESSAGE_BYTES} bytes exceeded`);
   }
+  let message: { type?: unknown; content?: unknown };
   try {
-    const message = JSON.parse(body);
-    if (!message || message.type !== "message" || !Array.isArray(message.content)) return body;
-    for (const block of message.content) {
-      if (!block || block.type !== "tool_use" || typeof block.name !== "string" || !(block.name in deps.inboundToolNameMap)) continue;
-      const name = block.name;
-      const input = JSON.stringify(block.input);
-      if (byteLength(input) > MAX_TOOL_INPUT_BYTES) {
-        return JSON.stringify({ type: "error", error: { type: "api_error", message: `Tool input limit ${MAX_TOOL_INPUT_BYTES} bytes exceeded: ${byteLength(input)} bytes for ${safeToolName(name)}` } });
-      }
-      block.input = JSON.parse(deps.translateToolArgs(input, name));
-      block.name = deps.inboundToolNameMap[name];
-    }
-    return JSON.stringify(message);
+    message = JSON.parse(body);
   } catch {
-    deps.debug?.("translateJsonMessage: invalid JSON or tool input; passed through unchanged");
+    deps.debug?.("translateJsonMessage: invalid JSON; passed through unchanged");
     return body;
   }
+  if (!message || message.type !== "message" || !Array.isArray(message.content)) return body;
+  for (const block of message.content as Array<Record<string, unknown>>) {
+    if (!block || block.type !== "tool_use" || typeof block.name !== "string" || !(block.name in deps.inboundToolNameMap)) continue;
+    const name = block.name;
+    const input = JSON.stringify(block.input);
+    if (byteLength(input) > MAX_TOOL_INPUT_BYTES) {
+      throw new ResponseLimitError(`Tool input limit ${MAX_TOOL_INPUT_BYTES} bytes exceeded: ${byteLength(input)} bytes for ${safeToolName(name)}`);
+    }
+    try {
+      block.input = JSON.parse(deps.translateToolArgs(input, name));
+    } catch {
+      deps.debug?.("translateJsonMessage: invalid tool input; passed through unchanged");
+      return body;
+    }
+    block.name = deps.inboundToolNameMap[name];
+  }
+  return JSON.stringify(message);
 }
 
-export function translateJsonResponse(response: Response, deps: StreamProcessorDeps): Response {
+/**
+ * The bridge's own failure, sent with a failure status: under the upstream's
+ * 200 the host would read an error envelope as a model answer.
+ */
+function limitResponse(message: string): Response {
+  return new Response(JSON.stringify({ type: "error", error: { type: "api_error", message } }), {
+    status: 502,
+    statusText: "Bad Gateway",
+    headers: { "content-type": "application/json" },
+  });
+}
+
+/**
+ * Translate a successful non-streaming JSON message. The whole body is read
+ * first (up to MAX_JSON_MESSAGE_BYTES) so a limit can fail the response
+ * rather than its content. A body left untranslated keeps its exact bytes.
+ */
+export async function translateJsonResponse(response: Response, deps: StreamProcessorDeps): Promise<Response> {
   if (!response.body) return response;
   const reader = response.body.getReader();
-  const encoder = new TextEncoder();
-  const decoder = new TextDecoder();
-  let cancelled = false;
-  const body = new ReadableStream<Uint8Array>({
-    async start(controller) {
-      let size = 0;
-      let text = "";
-      try {
-        while (!cancelled) {
-          const result = await reader.read();
-          if (cancelled) return;
-          if (result.done) {
-            controller.enqueue(encoder.encode(translateJsonMessage(text + decoder.decode(), deps)));
-            controller.close();
-            return;
-          }
-          size += result.value.byteLength;
-          if (size > MAX_JSON_MESSAGE_BYTES) {
-            controller.enqueue(encoder.encode(JSON.stringify({ type: "error", error: { type: "api_error", message: `JSON message limit ${MAX_JSON_MESSAGE_BYTES} bytes exceeded: ${size} bytes for unknown tool` } })));
-            controller.close();
-            void reader.cancel().catch(() => {});
-            return;
-          }
-          text += decoder.decode(result.value, { stream: true });
-        }
-      } catch (error) {
-        if (!cancelled) controller.error(error);
-      }
-    },
-    cancel(reason) { cancelled = true; return reader.cancel(reason); },
-  });
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > MAX_JSON_MESSAGE_BYTES) {
+      void reader.cancel().catch(() => {});
+      return limitResponse(`JSON message limit ${MAX_JSON_MESSAGE_BYTES} bytes exceeded`);
+    }
+    chunks.push(value);
+  }
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  const text = new TextDecoder().decode(bytes);
+  let translated: string;
+  try {
+    translated = translateJsonMessage(text, deps);
+  } catch (error) {
+    if (error instanceof ResponseLimitError) return limitResponse(error.message);
+    throw error;
+  }
   const headers = new Headers(response.headers);
   headers.delete("content-length");
-  return new Response(body, { status: response.status, statusText: response.statusText, headers });
+  return new Response(translated === text ? bytes : translated, { status: response.status, statusText: response.statusText, headers });
 }
 
 /** OpenCode 1 aborts a stream after 300s without bytes by default (chunkTimeout). */

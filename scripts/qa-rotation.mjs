@@ -13,22 +13,40 @@
  * subscription to observe a real 429 is not a reasonable test cost.
  */
 
-if (!process.argv.includes("--live")) {
-  console.error(
-    "qa-rotation.mjs is a live tool: it uses your real pool accounts, may refresh their tokens, " +
-      "and sends a real request to Anthropic. Re-run with --live to proceed. " +
-      "Credential-free checks: node scripts/qa-opencode1.mjs",
-  );
-  process.exit(2);
-}
-
 import http from "node:http";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { createRotationStateStore, defaultLockPath, defaultStatePath } from "../dist/pool/rotation-state.js";
-import BridgePlugin from "../dist/index.js";
+
+const SCENARIOS = ["s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10"];
+const cliArgs = process.argv.slice(2);
+const flags = cliArgs.filter((arg) => arg.startsWith("--"));
+const only = cliArgs.find((arg) => !arg.startsWith("--"));
+if (!flags.includes("--live")) {
+  console.error(
+    "qa-rotation.mjs is a live tool: it uses your real pool accounts, may refresh their tokens, " +
+      "and sends a real request to Anthropic. Re-run with --live to proceed " +
+      "(node scripts/qa-rotation.mjs --live [s1..s10]). Credential-free checks: node scripts/qa-opencode1.mjs",
+  );
+  process.exit(2);
+}
+const unknownFlag = flags.find((flag) => flag !== "--live");
+if (unknownFlag) {
+  console.error(`Unknown option "${unknownFlag}". Usage: node scripts/qa-rotation.mjs --live [${SCENARIOS.join("|")}]`);
+  process.exit(2);
+}
+if (only && !SCENARIOS.includes(only)) {
+  console.error(`Unknown scenario "${only}". Choose one of: ${SCENARIOS.join(", ")}`);
+  process.exit(2);
+}
+
+// Loaded only once the run is confirmed: loading the plugin probes the Claude
+// CLI and can read its credential file.
+const [{ createRotationStateStore, defaultLockPath, defaultStatePath }, { default: BridgePlugin }] = await Promise.all([
+  import("../dist/pool/rotation-state.js"),
+  import("../dist/index.js"),
+]);
 const OpenCodeClaudeBridge = BridgePlugin.server;
 
 // A running OpenCode writes the live state file under its own lock while this
@@ -406,12 +424,7 @@ async function s10() {
   );
 }
 
-const only = process.argv[2];
 const all = { s1, s2, s3, s4, s5, s6, s7, s8, s9, s10 };
-if (only && !Object.hasOwn(all, only)) {
-  console.error(`Unknown scenario "${only}". Choose one of: ${Object.keys(all).join(", ")}`);
-  process.exit(2);
-}
 for (const [name, fn] of Object.entries(all)) {
   if (only && only !== name) continue;
   try {

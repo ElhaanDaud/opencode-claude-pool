@@ -5,21 +5,15 @@
  * the usage endpoint, and captures Claude Code's system prompt into the
  * bridge's prompt cache. It runs only with --live. Credential-free checks:
  * scripts/qa-opencode1.mjs and scripts/qa-opencode2.mjs.
+ *
+ * Importing it runs nothing; the tests use its capture and report functions.
  */
-
-if (!process.argv.includes("--live")) {
-  console.error(
-    "validate-opencode-oauth.js is a live tool: it uses your real logins, sends real requests and " +
-      "captures Claude Code's system prompt. Re-run with --live to proceed (npm run validate:oauth -- --live ...).",
-  );
-  process.exit(2);
-}
 
 import http from "node:http";
 import https from "node:https";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -49,22 +43,21 @@ function parseArgs(argv) {
     else if (arg === "--out-dir") args.outDir = resolve(argv[++i]);
     else if (arg === "--skip-claude") args.skipClaude = true;
     else if (arg === "--skip-opencode") args.skipOpenCode = true;
-    else if (arg === "--help" || arg === "-h") {
-      console.log(`Usage: node scripts/validate-opencode-oauth.js [options]
+  }
+
+  return args;
+}
+
+const USAGE = `Usage: node scripts/validate-opencode-oauth.js --live [options]
 
 Options:
+  --live             Required: run against your real logins and the real API
   --model <id>       Model to use (default: claude-sonnet-4-6)
   --prompt <text>    Prompt to send to both clients
   --out-dir <dir>    Directory for capture artifacts
   --skip-claude      Skip official Claude Code capture
   --skip-opencode    Skip OpenCode capture
-`);
-      process.exit(0);
-    }
-  }
-
-  return args;
-}
+`;
 
 function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
@@ -133,7 +126,9 @@ const SECRET_HEADERS = new Set([
   "set-cookie",
 ]);
 
-function redactHeaders(headers) {
+export { SECRET_HEADERS };
+
+export function redactHeaders(headers) {
   const copy = { ...headers };
   for (const name of Object.keys(copy)) {
     if (SECRET_HEADERS.has(name.toLowerCase())) copy[name] = "<redacted>";
@@ -151,6 +146,22 @@ function sortedDifference(left, right) {
   return left.filter((item) => !rightSet.has(item)).sort();
 }
 
+/**
+ * What is kept of a request. Its headers are redacted here, before anything
+ * else can read them: the comparison report is built from these captures, and
+ * only the request forwarded upstream needs the real credentials.
+ */
+export function captureOf(req, bodyBuffer, label, index) {
+  return {
+    index,
+    label,
+    method: req.method,
+    url: req.url,
+    headers: redactHeaders(req.headers),
+    body: bodyBuffer.toString("utf8"),
+  };
+}
+
 async function startCaptureProxy(label, outDir) {
   let requestCount = 0;
   const captures = [];
@@ -161,22 +172,15 @@ async function startCaptureProxy(label, outDir) {
     req.on("end", () => {
       const bodyBuffer = Buffer.concat(chunks);
       requestCount += 1;
-      const capture = {
-        index: requestCount,
-        label,
-        method: req.method,
-        url: req.url,
-        headers: req.headers,
-        body: bodyBuffer.toString("utf8"),
-      };
+      const capture = captureOf(req, bodyBuffer, label, requestCount);
       captures.push(capture);
 
       writeFileSync(
         join(outDir, `${label}-${requestCount}-headers.json`),
         JSON.stringify({
-          method: req.method,
-          url: req.url,
-          headers: redactHeaders(req.headers),
+          method: capture.method,
+          url: capture.url,
+          headers: capture.headers,
         }, null, 2),
       );
       writeFileSync(join(outDir, `${label}-${requestCount}-body.json`), capture.body);
@@ -350,7 +354,7 @@ function firstMessageCapture(captures) {
   return messageCaptures.at(-1);
 }
 
-function compareRequests(reference, candidate) {
+export function compareRequests(reference, candidate) {
   if (!reference || !candidate) {
     return { available: false };
   }
@@ -373,6 +377,14 @@ function compareRequests(reference, candidate) {
     if (ignoredHeaders.has(key)) continue;
     const left = reference.headers?.[key];
     const right = candidate.headers?.[key];
+    // Credentials are compared by presence only and never written out, even
+    // from a capture that somehow kept their values.
+    if (SECRET_HEADERS.has(key.toLowerCase())) {
+      if ((left === undefined) !== (right === undefined)) {
+        headerDiff[key] = { claude: left === undefined ? null : "<redacted>", opencode: right === undefined ? null : "<redacted>" };
+      }
+      continue;
+    }
     if (left !== right) {
       headerDiff[key] = { claude: left ?? null, opencode: right ?? null };
     }
@@ -621,7 +633,23 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  console.error(error instanceof Error ? error.stack || error.message : String(error));
-  process.exit(1);
-});
+const runDirectly = process.argv[1] !== undefined
+  && realpathSync(resolve(process.argv[1])) === realpathSync(fileURLToPath(import.meta.url));
+if (runDirectly) {
+  const cliArgs = process.argv.slice(2);
+  if (cliArgs.includes("--help") || cliArgs.includes("-h")) {
+    console.log(USAGE);
+    process.exit(0);
+  }
+  if (!cliArgs.includes("--live")) {
+    console.error(
+      "validate-opencode-oauth.js is a live tool: it uses your real logins, sends real requests and " +
+        "captures Claude Code's system prompt. Re-run with --live to proceed (npm run validate:oauth -- --live ...).",
+    );
+    process.exit(2);
+  }
+  main().catch((error) => {
+    console.error(error instanceof Error ? error.stack || error.message : String(error));
+    process.exit(1);
+  });
+}

@@ -37,38 +37,70 @@ function marked(blocks: unknown): Block[] {
   return blocks.filter((block): block is Block => Boolean(block) && typeof block === "object" && "cache_control" in block);
 }
 
+function ttlOf(block: Block): string {
+  const marker = block.cache_control;
+  return typeof marker === "object" && marker !== null && "ttl" in marker && marker.ttl === "1h" ? "1h" : "5m";
+}
+
+function markedInMessages(messages: unknown): Block[] {
+  if (!Array.isArray(messages)) return [];
+  return messages.flatMap((message: unknown) =>
+    typeof message === "object" && message !== null && "content" in message ? marked(message.content) : []);
+}
+
 /**
  * Keep the host's prompt-cache markers, which place the cache where OpenCode
- * meant it (its system prompt, its latest turns). Only when the request carries
- * more than the API allows are markers dropped: tool markers first, since any
- * later marker caches the tools too, then the earliest message markers, then
- * the earliest system ones.
+ * meant it (its system prompt, its latest turns). Only what the API rejects is
+ * dropped: a 5m marker ahead of a 1h one, which reordering tools can produce
+ * (the later 1h marker caches that prefix anyway), and markers past four
+ * breakpoints, a top-level cache_control counting as one: tool markers first,
+ * since any later marker caches the tools too, then the earliest message
+ * markers, then the earliest system ones.
  */
 export function limitCacheBreakpoints(parsed: {
+  cache_control?: unknown;
   tools?: unknown;
   system?: unknown;
-  messages?: Array<{ content?: unknown }>;
+  messages?: unknown;
 }): SettingChange[] {
+  const changes: SettingChange[] = [];
+  const inPromptOrder = [...marked(parsed.tools), ...marked(parsed.system), ...markedInMessages(parsed.messages)];
+  let lastHour = -1;
+  inPromptOrder.forEach((block, index) => { if (ttlOf(block) === "1h") lastHour = index; });
+  const ahead = inPromptOrder.slice(0, Math.max(lastHour, 0)).filter((block) => ttlOf(block) === "5m");
+  for (const block of ahead) delete block.cache_control;
+  if (ahead.length > 0) {
+    changes.push({
+      setting: "cache_control",
+      from: "5m marker before a 1h one",
+      to: "1h markers first",
+      reason: "compatibility",
+      note: `the API requires 1h markers before 5m ones; dropped ${ahead.length} 5m marker${ahead.length === 1 ? "" : "s"}`,
+    });
+  }
+
   const candidates: Array<[string, Block]> = [
     ...marked(parsed.tools).map((block): [string, Block] => ["tool", block]),
-    ...(parsed.messages ?? []).flatMap((message) => marked(message.content)).map((block): [string, Block] => ["message", block]),
+    ...markedInMessages(parsed.messages).map((block): [string, Block] => ["message", block]),
     ...marked(parsed.system).map((block): [string, Block] => ["system", block]),
   ];
-  const total = candidates.length;
-  if (total <= MAX_CACHE_BREAKPOINTS) return [];
+  const automatic = typeof parsed.cache_control === "object" && parsed.cache_control !== null ? 1 : 0;
+  const total = candidates.length + automatic;
+  if (total <= MAX_CACHE_BREAKPOINTS) return changes;
   const dropped = new Map<string, number>();
   for (const [where, block] of candidates.slice(0, total - MAX_CACHE_BREAKPOINTS)) {
     delete block.cache_control;
     dropped.set(where, (dropped.get(where) ?? 0) + 1);
   }
   const what = [...dropped].map(([where, count]) => `${count} ${where} marker${count === 1 ? "" : "s"}`).join(", ");
-  return [{
+  changes.push({
     setting: "cache_control",
     from: `${total} markers`,
     to: `${MAX_CACHE_BREAKPOINTS} markers`,
     reason: "compatibility",
-    note: `the API accepts at most ${MAX_CACHE_BREAKPOINTS}; dropped ${what}`,
-  }];
+    note: `the API accepts at most ${MAX_CACHE_BREAKPOINTS}${automatic ? ", the top-level one included" : ""}; dropped ${what}`,
+  });
+  return changes;
 }
 
 /**
@@ -141,6 +173,25 @@ export function capturedBlocksToSend(
  * Append one JSON line per request to ANTHROPIC_TRACE_PATH. Opt-in, local,
  * and free of secrets: no tokens, no prompt text.
  */
+/** Setting fields a trace may hold: API enums, numbers and tool names. */
+const TRACEABLE_KEYS = new Set(["type", "effort", "budget_tokens", "display", "name", "keep", "edits", "thinking", "output_config"]);
+
+/**
+ * The kinds and numbers in a setting, for the trace. Every other field is
+ * dropped, since caller objects can carry content: an output schema, say.
+ */
+export function traceableSetting(value: unknown, depth = 0): unknown {
+  if (value === null || typeof value === "number" || typeof value === "boolean") return value;
+  if (typeof value === "string") return value.slice(0, 80);
+  if (depth >= 4 || typeof value !== "object") return undefined;
+  if (Array.isArray(value)) return value.slice(0, 8).map((item) => traceableSetting(item, depth + 1));
+  const kept: Record<string, unknown> = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (TRACEABLE_KEYS.has(key)) kept[key] = traceableSetting(item, depth + 1);
+  }
+  return kept;
+}
+
 let traceFailed = false;
 
 export function appendTrace(record: Record<string, unknown>): void {

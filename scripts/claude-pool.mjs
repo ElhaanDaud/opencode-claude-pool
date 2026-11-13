@@ -155,8 +155,11 @@ async function installHook() {
   // URL.pathname is percent-encoded (a space becomes %20); single-quote the
   // decoded path so spaces and quotes in the checkout path survive the shell.
   const self = `'${fileURLToPath(import.meta.url).replaceAll("'", "'\\''")}'`;
-  console.log(`# --- opencode-claude-bridge account pool ---
-# Add to ~/.zshrc, then: source ~/.zshrc
+  // The leading newline keeps the start marker on its own line when the rc file lacks a final newline.
+  console.log(`
+# >>> claude-pool hook >>>
+# opencode-claude-bridge account pool. Remove everything down to the closing
+# "<<< claude-pool hook <<<" line to uninstall it.
 # A function, not an alias: aliases are expanded at parse time and are not
 # enabled in non-interactive shells, so they fail inside scripts.
 claude-pool() { node ${self} "$@"; }
@@ -170,7 +173,8 @@ claude() {
     node ${self} auto
   fi
   return "$claude_rc"
-}`);
+}
+# <<< claude-pool hook <<<`);
 }
 
 async function whoami() {

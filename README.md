@@ -29,8 +29,15 @@ Check your version with `opencode --version`. For `1.x`:
 
 ```bash
 git clone https://github.com/ElhaanDaud/opencode-claude-pool.git ~/src/opencode-claude-bridge
-cd ~/src/opencode-claude-bridge && npm ci --ignore-scripts && npm run build
+cd ~/src/opencode-claude-bridge && node scripts/install-deps.mjs && npm run build
 ```
+
+`scripts/install-deps.mjs` runs `npm ci` without install scripts, with a
+scratch HOME and cache, an empty npm config, and nothing from your environment
+but `PATH`, `TMPDIR`, the proxy variables and `NODE_EXTRA_CA_CERTS`. Fetching
+the build's dependencies (TypeScript and Node's type definitions) never
+reads your `~/.npmrc`, `npm_config_*` variables or tokens, and never writes to
+your npm cache. A registry mirror set in your npm config isn't used either.
 
 **2. Create a wrapper**
 
@@ -57,7 +64,7 @@ Restart OpenCode. If you're logged into the Claude CLI (`claude login`), the plu
 **Upgrade:**
 
 ```bash
-cd ~/src/opencode-claude-bridge && git pull && npm ci --ignore-scripts && npm run build
+cd ~/src/opencode-claude-bridge && git pull && node scripts/install-deps.mjs && npm run build
 ```
 
 Then restart OpenCode. Full walkthrough, Linux notes and troubleshooting: [SETUP.md](SETUP.md).
@@ -71,11 +78,11 @@ separate entry, `dist/opencode2`, from the same build. For `opencode --version` 
 
 ```bash
 git clone https://github.com/ElhaanDaud/opencode-claude-pool.git ~/src/opencode-claude-bridge
-cd ~/src/opencode-claude-bridge && npm ci --ignore-scripts && npm run build
+cd ~/src/opencode-claude-bridge && node scripts/install-deps.mjs && npm run build
 ```
 
 A checkout of the old `feat/opencode-2` branch can switch over:
-`git checkout main && git pull && npm ci --ignore-scripts && npm run build`.
+`git checkout main && git pull && node scripts/install-deps.mjs && npm run build`.
 
 **2. Register the build directory** in `~/.config/opencode/opencode.json`. V2
 uses the `plugins` key (plural) and only loads a local plugin from a directory,
@@ -125,16 +132,23 @@ on V1, through V2's `http.request` and `http.response` hooks. What differs:
   mid-request ends the same way.
 - V2 has no `auth.json`, so nothing is mirrored there.
 
-**Upgrade:** `cd ~/src/opencode-claude-bridge && git pull && npm ci --ignore-scripts && npm run build`, then restart OpenCode.
+**Upgrade:** `cd ~/src/opencode-claude-bridge && git pull && node scripts/install-deps.mjs && npm run build`, then restart OpenCode.
 
 ### Uninstall and roll back
 
-1. **Stop using it in OpenCode.** Remove the bridge's entry from your OpenCode config — the `plugin` entry for `claude-bridge-wrapper.mjs` (OpenCode 1) or the `plugins` entry for `dist/opencode2` (OpenCode 2) — or restore the backup you made before installing. Delete `~/.config/opencode/claude-bridge-wrapper.mjs`. Restart OpenCode.
-2. **Remove the shell hook**, if you installed it: delete the `claude-pool` function that `install-hook` appended to `~/.zshrc` or `~/.bashrc`.
-3. **Optionally remove the pool and its state.** `claude-pool remove <label>` for each account (or delete the `opencode-claude-bridge` Keychain items / `~/.local/share/opencode-claude-bridge/accounts/`), then `~/.local/share/opencode-claude-bridge/`. Any `*.stale` journal there may hold the only live token of a login; delete it only once you no longer need that login.
-4. **OpenCode's own login** in `~/.local/share/opencode/auth.json` stays until you run `opencode auth logout`. Claude Code's login is untouched throughout.
+1. **Quit OpenCode** (every window), so nothing refreshes a token while you remove it.
+2. **Stop using it in OpenCode.** Remove the bridge's entries from your OpenCode config — the `plugin` entry for `claude-bridge-wrapper.mjs` (OpenCode 1) and the `plugins` entry for `dist/opencode2` (OpenCode 2) — or restore a backup you made before installing (`opencode.json.bak-<date>`). Delete `~/.config/opencode/claude-bridge-wrapper.mjs`.
+3. **Remove the shell hook**, if you installed it. It defines two functions, `claude-pool` and a `claude` wrapper, between marker lines; this removes exactly that block (keeping a `.bak` copy of the file):
 
-To roll back to an earlier version instead: `git checkout <commit or tag> && npm ci --ignore-scripts && npm run build`, then restart OpenCode. Logins are not part of a rollback: a refresh token copied or backed up earlier has usually been spent since, so restoring it doesn't bring a login back. If a login stops working after a rollback, sign in again (`claude login`, then `claude-pool enroll`; or `opencode auth login`). Check what you are running with `npm run verify:build` and the `build …` line the plugin logs at startup.
+   ```bash
+   sed -i.bak '/^# >>> claude-pool hook >>>$/,/^# <<< claude-pool hook <<<$/d' ~/.zshrc   # or ~/.bashrc
+   ```
+
+   A hook installed by an earlier version has no marker lines: delete its `claude-pool` and `claude` functions, and the comment lines above them, by hand.
+4. **Optionally remove the pool and its state.** `node scripts/claude-pool.mjs remove <label>` in the checkout for each account (or delete the `opencode-claude-bridge` Keychain items / `~/.local/share/opencode-claude-bridge/accounts/`), then `~/.local/share/opencode-claude-bridge/`. A `*journal*.json` or `*.stale` file there may hold the only live token of a login; delete it only once you no longer need that login.
+5. **OpenCode's own login** in `~/.local/share/opencode/auth.json` stays until you run `opencode auth logout`. Claude Code's login is untouched throughout.
+
+To roll back to an earlier version instead: `git checkout <commit or tag> && node scripts/install-deps.mjs && npm run build`, then restart OpenCode. A version from before `install-deps.mjs` existed takes `npm ci --ignore-scripts` in its place, which uses your npm config. Logins are not part of a rollback: a refresh token copied or backed up earlier has usually been spent since, so restoring it doesn't bring a login back. If a login stops working after a rollback, sign in again (`claude login`, then `claude-pool enroll`; or `opencode auth login`). Check what you are running with `npm run verify:build` and the `build …` line the plugin logs at startup.
 
 ## How the bridge works
 
@@ -165,6 +179,7 @@ Anthropic rotates the refresh token on every refresh and kills the old one at on
 - OpenCode's own login never borrows Claude Code's token, even if Claude Code is logged into a valid account and OpenCode's is rejected; the request fails and says how to sign in again. Following the Claude CLI to whatever account it is logged into happens only for the Claude Code copy, and each request's `metadata.user_id` names the account whose token it carries.
 - `claude-pool enroll` hands a login to the pool. Run `claude login` again afterwards so Claude Code has a chain of its own; `claude-pool` warns when the two still share one.
 - Startup copies Claude Code's login into OpenCode's store, but never over a login of OpenCode's own.
+- A sign-in whose save fails changes nothing: the login stored before it keeps its owner, so OpenCode's own is still refreshed.
 - A cancelled request stops waiting at once; a refresh it already sent still finishes and is saved, since the old refresh token is spent the moment it is sent.
 
 ### Logout, disconnect and removal
@@ -180,7 +195,7 @@ Every outbound OAuth request is rewritten to match what Claude Code sends on the
 - **Headers** — `user-agent`, `anthropic-beta`, `anthropic-version`, `x-app`, `x-stainless-*`, `x-claude-code-session-id` and `anthropic-dangerous-direct-browser-access`; `x-api-key` is removed. The billing metadata (`cc_version`, `cc_entrypoint`, `cch`) is not a header: it is sent as the first system block (`x-anthropic-billing-header: …`).
 - **Body fields** — `metadata` (session ID, billing info) and the `?beta=true` URL parameter; defaults for `thinking`, `output_config.effort` and `context_management` only where the caller set none (see [Model handling](#model-handling)).
 - **System prompt** — the billing block and Claude Code's identity line lead. If a Claude Code prompt was captured with the validator (`~/.cache/opencode-claude-bridge/claude-system-prompt.json`), its sections that describe Claude Code follow; its `# Memory` and `# Session-specific guidance` sections are never sent, because they describe the session it was captured in (a memory directory under that project, that session's skills). A capture from a Claude Code version other than the installed one is still used, with a warning in the log to capture it again. OpenCode's own system blocks (agent prompt, AGENTS.md, instructions) follow, as OpenCode wrote them: the bridge no longer renames "OpenCode" in them.
-- **Prompt caching** — OpenCode's own `cache_control` markers are kept where OpenCode put them. The capture's markers are dropped, and if a request still carries more than the API's limit of 4, markers on tools go first (any later marker caches the tools too), then the earliest message markers, then the earliest system ones.
+- **Prompt caching** — OpenCode's own `cache_control` markers are kept where OpenCode put them. The capture's markers are dropped. The API takes at most 4 breakpoints, a top-level `cache_control` (automatic caching) counting as one; past that, markers on tools go first (any later marker caches the tools too), then the earliest message markers, then the earliest system ones. The API also rejects a 5-minute marker ahead of a 1-hour one, which sorting the tools can produce, so such a 5-minute marker is dropped: the later 1-hour one already caches that prefix.
 - **Custom and MCP tools** — sent under the names OpenCode gives them, with OpenCode's own description and schema, after Claude Code's core tools. No prefix is added and their names are not translated in either direction: only OpenCode's built-in tools with a Claude Code counterpart are renamed (`bash` -> `Bash`), so a tool merely named like one, such as `mcp_bash`, keeps its name.
 
 ### Tools
@@ -190,6 +205,7 @@ Each of OpenCode's built-in tools that has a Claude Code counterpart goes out un
 - Names are mapped per request and only for tools active in that request, so a custom or MCP tool keeps its name: one already called `Read`, or `mcp_bash`, is sent as is, and the built-in it collides with keeps its own name. The same mapping renames the tool's calls in history, a named `tool_choice`, and the model's calls in the response back to OpenCode's names.
 - Arguments pass through as the schema the model was shown declares them, in both directions. Where a model uses a Claude Code name the host tool doesn't declare (`file_path` for `filePath`), it is renamed only if the host declares the other one; a field the host tool doesn't declare is dropped.
 - A continuation call (`task_id`) is sent to the task tool as made: no agent is filled in, so it resumes with the agent it had.
+- On the way back, only a JSON message (as a whole) and an event stream (event by event) are rewritten; any other successful response is returned byte for byte. In a stream, a tool call's arguments are held until the call ends. Fixed limits bound what is held: 16 MiB for one call, one event, one JSON message and all open calls together, and 32 open calls at once. Going over one ends the stream with an `error` event, or turns a JSON response into a 502, rather than truncating anything.
 - Only a built-in that arrives without a schema falls back to Claude Code's captured definition, minus any field the bridge would have to drop; its arguments are then translated between the two shapes.
 - Custom and MCP tools are sent exactly as OpenCode gave them, after the built-ins. Both groups are sorted by name so the request prefix stays stable for prompt caching.
 - For non-Claude models on OpenRouter-style targets, OpenCode's tools go out untouched. OpenCode 2 still sends Claude Code's definitions for its built-ins; see [OpenCode 2](#opencode-2-manual).
@@ -259,8 +275,11 @@ on startup. For instant adoption without restarting OpenCode, install a shell
 hook so `claude login` enrolls as it completes:
 
 ```bash
-node scripts/claude-pool.mjs install-hook >> ~/.zshrc && source ~/.zshrc
+grep -q '^# >>> claude-pool hook >>>$' ~/.zshrc 2>/dev/null || node scripts/claude-pool.mjs install-hook >> ~/.zshrc
+source ~/.zshrc
 ```
+
+The `grep` keeps a second run from adding the hook twice; see [Uninstall and roll back](#uninstall-and-roll-back) to remove it.
 
 Accounts are matched by refresh token, then by email, so re-logging into a
 pooled account never duplicates it. A healthy entry keeps its own tokens, since
@@ -274,7 +293,7 @@ newer login and re-enabled. Set `CLAUDE_POOL_AUTO_ENROLL=0` to disable.
 | --- | --- |
 | `claude-pool enroll [label] [--replace]` | Add the account Claude CLI is logged into |
 | `claude-pool auto` | Enroll the logged-in account if the pool has not seen it, or repair its disabled entry from a newer login. Does nothing while the pool is empty |
-| `claude-pool install-hook` | Print a shell function that runs `auto` after `claude login` |
+| `claude-pool install-hook` | Print the shell hook: a `claude-pool` function, and a `claude` wrapper that runs `auto` after `claude login` |
 | `claude-pool whoami` | Show which account Claude CLI is logged into, and whether it is pooled |
 | `claude-pool status` | Active account and what rotation would pick next |
 | `claude-pool dashboard` | Interactive manager (prints the status when not in a terminal) |
@@ -396,7 +415,7 @@ These are deliberate choices, not guarantees:
 - **Corrupt rotation state** is moved aside (`rotation-state.json.corrupt-<time>`) and the pool starts from defaults, so accounts that were disabled or cooling are tried again. A dead login fails its refresh again and is disabled again; an exhausted one gets a 429 and cools until its real reset. The cost is a few failed attempts, and no token is lost: the state file holds no credentials.
 - **A lost token response can't be recovered.** If the network drops after Anthropic has rotated a refresh token but before its reply arrives, the old token is spent and the new one never reached this machine. Journals cover everything after the reply arrives, not that gap; that login needs a new sign-in.
 - **A save the journal couldn't cover** — the journal write itself fails — still saves the tokens, logging the failure, since skipping the save would drop the only valid ones. A journal that can't be moved aside stops further refreshes of that login rather than overwrite it.
-- **Writes are read-compare-write, not atomic swaps.** Every writer in this package takes the rotation lock, and a refresh re-reads the stored login before saving: one replaced meanwhile (another `opencode auth login`, a hand edit) is kept and the refresh's tokens are set aside in a `.stale` file. A writer that doesn't take the lock can still land in the instant between that check and the save.
+- **Writes are read-compare-write, not atomic swaps.** Every writer in this package takes the rotation lock, and a refresh re-reads the stored login before saving: one replaced meanwhile (another `opencode auth login`, a hand edit) is kept and the refresh's tokens are set aside in a `.stale` file. The request goes out with the new login instead, or, if that one has expired, gets a 503 that OpenCode retries with it; never with the login it replaced. A writer that doesn't take the lock can still land in the instant between that check and the save.
 - **The lock is a local-machine lock.** On one host a stale lock is reclaimed only once its holder's process is gone. On a shared or network filesystem a holder on another host can't be checked, so its lock is reclaimed by age (3 minutes); don't share the pool's directory between machines that refresh at the same time. The lock does not coordinate an unmodified Claude Code, which is why its login is never refreshed here.
 - **Releasing the lock** removes it only if it still holds this process's id, so a lock reclaimed and taken over by another process is never removed by the old holder.
 
@@ -412,7 +431,7 @@ Requests that carry the login never follow redirects: a redirect is handed back 
 
 ### Request trace
 
-Set `ANTHROPIC_TRACE_PATH=/path/to/trace.jsonl` to append one JSON line per OAuth request: the build that served it (version, commit, source hash), OpenCode's session id (which links a parent session to the subagents it starts), the route, model, which login served it (pool label, or `single` with its owner), the thinking/effort/temperature/tool_choice/context settings actually sent, every setting the bridge set or changed with its reason, any conversation repair, the retries, rotations and token refreshes it took (with why) and how many requests it sent, the tool names, the status and the time taken. It holds no tokens and no prompt text. If the file can't be written, requests carry on and the log says so once.
+Set `ANTHROPIC_TRACE_PATH=/path/to/trace.jsonl` to append one JSON line per OAuth request: the build that served it (version, commit, source hash), OpenCode's session id (which links a parent session to the subagents it starts), the route, model, which login served it (pool label, or `single` with its owner), the kind of each setting actually sent (thinking type and budget, effort, temperature, the forced tool's name, context edit types; never other fields such as an output schema), every setting the bridge set or changed with its reason, any conversation repair, the retries, rotations and token refreshes it took (with why) and how many requests it sent, the tool names, the status and the time taken. It holds no tokens and no prompt text. If the file can't be written, requests carry on and the log says so once.
 
 The trace shows what was sent, not how well the model did. Comparing quality between API-key and subscription use needs the same model, settings and tasks on both — see `scripts/qa-opencode1.mjs` under [Local validation](#local-validation) for the offline half of that.
 
@@ -465,9 +484,9 @@ reports its results by kind of evidence, with what it leaves out:
 
 | Class | What it is | How to run | Last run (13 Nov 2026) |
 |---|---|---|---|
-| fixture | in-process unit tests on fixed inputs | `npm test` | 305/305 |
-| injected-boundary | fake servers, stubbed `security`, fault injection at one boundary | `npm test` | 294/294 |
-| process | real child processes racing on real lock, journal and store files | `npm test` | 64/64 |
+| fixture | in-process unit tests on fixed inputs | `npm test` | 318/318 |
+| injected-boundary | fake servers, stubbed `security`, fault injection at one boundary | `npm test` | 300/300 |
+| process | real child processes racing on real lock, journal and store files, and `verify:build` in a scratch checkout | `npm test` | 83/83 |
 | native | the pool's macOS Keychain backend against a temporary keychain it creates and deletes | `npm run test:native` | 2/2 |
 | real host | OpenCode 1.18.30 + OhMyOpenCode 4.19.4 against a fake API, API key vs OAuth: skills, commands, grep, bash, read, MCP, category/subagent/background/continuation tasks, invalid input | `node scripts/qa-opencode1.mjs` | 36/36 |
 | real host, OpenCode 2 | the V2 entry under a real OpenCode 2 | `node scripts/qa-opencode2.mjs --bin …` | **not run**: no OpenCode 2.x build was available from npm |
@@ -593,9 +612,10 @@ src/
 
 scripts/
   claude-pool.mjs             — `claude-pool` CLI (bin entry)
-  qa-rotation.mjs             — End-to-end rotation scenarios (real API + local fake upstream)
+  qa-rotation.mjs             — --live [s1..s10]: rotation scenarios on your pool (real API + local fake upstream)
+  install-deps.mjs            — npm ci without your npm config, credentials, cache or install scripts
   run-tests.mjs               — npm test: runs the compiled tests by evidence class, lists exclusions
-  build-info.mjs, verify-build.mjs — dist/BUILD-INFO.json (source and output hashes) and its check
+  build-info.mjs, verify-build.mjs — dist/BUILD-INFO.json (package, TypeScript, source, build-input and output hashes) and its check
   check-package.mjs           — fails if the npm package holds tests or anything outside dist/
   qa-opencode1.mjs            — Real OpenCode 1 (+ OhMyOpenCode) against a local fake Anthropic API,
                                 API key vs OAuth on one workload

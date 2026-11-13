@@ -203,9 +203,13 @@ async function runMode(mode) {
       if (key === 'continue') ok = ok && Boolean(sessionIn(result)) && sessionIn(result) === sessionIn(resultFor(history, 'toolu_task'));
       check(`${mode} ${key}`, ok, result ? text(result.content).slice(0, 160).replace(/\s+/g, ' ') : 'missing tool_result');
     }
-    for (const [key, expected] of [['category', /Sisyphus-Junior[\s\S]*\bOK\b/i], ['background', /\bbg_[\w-]+/], ['collect', /\bOK\b/], ['command', /(?:skill|command).*init-deep/i], ['invalid_skill', /Skill or command "qa-skill-does-not-exist-4817" not found/i], ['invalid_task', /Invalid arguments: Must provide either category or subagent_type/i], ['mcp', /QA-MCP-4817/]]) {
+    // A success must come back as one, and an intended failure must carry the
+    // handler's own error text; matching text alone would pass an error result.
+    for (const [key, expected, outcome] of [['category', /Sisyphus-Junior[\s\S]*\bOK\b/i, 'success'], ['background', /\bbg_[\w-]+/, 'success'], ['collect', /\bOK\b/, 'success'], ['command', /(?:skill|command).*init-deep/i, 'success'], ['invalid_skill', /Skill or command "qa-skill-does-not-exist-4817" not found/i, 'failure'], ['invalid_task', /Invalid arguments: Must provide either category or subagent_type/i, 'failure'], ['mcp', /QA-MCP-4817/, 'success']]) {
       const result = resultFor(history, `toolu_${key}`);
-      check(`${mode} ${key}`, result && expected.test(text(result.content)) && (key !== 'command' || !/not found/i.test(text(result.content))), result ? text(result.content).slice(0, 200).replace(/\s+/g, ' ') : 'missing tool_result');
+      const content = text(result?.content);
+      const ok = Boolean(result) && expected.test(content) && (outcome === 'failure' || (result.is_error !== true && !/not found|^error\b/i.test(content)));
+      check(`${mode} ${key}`, ok, result ? `${result.is_error ? '[is_error] ' : ''}${content.slice(0, 200).replace(/\s+/g, ' ')}` : 'missing tool_result');
     }
     const mcpArgs = fs.existsSync(mcpLog) ? fs.readFileSync(mcpLog, 'utf8').trim().split('\n').map((line) => JSON.parse(line)) : [];
     check(`${mode} mcp arguments`, mcpArgs.some((args) => isDeepStrictEqual(args, { message: 'QA-MCP-4817', file_path: 'keep-this-exactly' })), JSON.stringify(mcpArgs));
@@ -252,10 +256,18 @@ async function main() {
       const wire = wireTools.find((t) => t.name === (names[host.name] ?? host.name));
       if (!wire || !isDeepStrictEqual(wire.input_schema, host.input_schema)) schemaErrors.push(host.name);
       if (!wire) fieldErrors.push(`${host.name}:missing`);
-      else for (const key of Object.keys(host)) if (!(key in wire)) fieldErrors.push(`${host.name}.${key}`);
+      else for (const key of Object.keys(host)) {
+        // The name maps to Claude Code's; a description may gain one leading
+        // sentence naming the host tool. Every other field must be the host's own value.
+        if (key === 'name') continue;
+        const same = key === 'description'
+          ? wire.description === host.description || wire.description?.endsWith(`\n\n${host.description}`)
+          : isDeepStrictEqual(wire[key], host[key]);
+        if (!same) fieldErrors.push(`${host.name}.${key}`);
+      }
     }
     check('oauth native schemas', Boolean(api && oauth && hostTools.length && !schemaErrors.length), schemaErrors.join(', ') || (!api || !oauth ? 'missing parent request' : 'all host schemas match'));
-    check('oauth tool fields preserved', Boolean(api && oauth && hostTools.length && !fieldErrors.length), fieldErrors.join(', ') || (!api || !oauth ? 'missing parent request' : 'all host fields present'));
+    check('oauth tool fields preserved', Boolean(api && oauth && hostTools.length && !fieldErrors.length), fieldErrors.join(', ') || (!api || !oauth ? 'missing parent request' : 'every host field carries the host value'));
     const apiMcp = hostTools.find((t) => t.name === 'qa_echo'), oauthMcp = wireTools.find((t) => t.name === 'qa_echo');
     check('oauth mcp definition unchanged', Boolean(apiMcp && oauthMcp && isDeepStrictEqual(apiMcp, oauthMcp)), apiMcp && oauthMcp ? 'all fields compared' : 'missing MCP definition');
   }

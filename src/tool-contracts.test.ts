@@ -37,6 +37,49 @@ const host = (name: string, properties: Record<string, unknown>) => ({
   name, description: `host ${name}`, input_schema: schema(properties), eager_input_streaming: true,
 });
 
+/** Each cache marker sent, in prompt order (tools, system, messages), with its TTL. */
+function sentMarkers(sent: { tools?: unknown[]; system?: unknown[]; messages?: Array<{ content: unknown }> }): string[] {
+  const blocks = [...(sent.tools ?? []), ...(sent.system ?? []),
+    ...(sent.messages ?? []).flatMap((message) => Array.isArray(message.content) ? message.content : [])] as Array<{ cache_control?: { ttl?: string }; name?: string; text?: string }>;
+  return blocks.filter((block) => block.cache_control).map((block) => `${block.cache_control!.ttl ?? "5m"} ${block.name ?? block.text}`);
+}
+
+describe("prompt-cache markers on the OAuth path", () => {
+  it("sends only markers the API accepts once tools are sorted and automatic caching is on", async () => {
+    const bodies: Array<{ cache_control?: unknown; tools?: unknown[]; system?: unknown[]; messages?: Array<{ content: unknown }> }> = [];
+    globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+      bodies.push(JSON.parse(String(init?.body)));
+      return new Response(JSON.stringify({ type: "message", role: "assistant", content: [{ type: "text", text: "ok" }] }),
+        { status: 200, headers: { "content-type": "application/json" } });
+    }) as typeof fetch;
+    const hooks = await plugin.server({ client: { auth: { set: async () => {} } } });
+    const loaded = await hooks.auth.loader(async () => ({ type: "oauth", access: "token", refresh: "refresh", expires: Date.now() + 3_600_000 }), { models: {} }) as { fetch: typeof fetch };
+    const send = (body: Record<string, unknown>) => loaded.fetch("https://api.anthropic.com/v1/messages",
+      { method: "POST", body: JSON.stringify({ model: "claude-haiku-4-5-20251001", ...body }) });
+    const five = { type: "ephemeral" };
+    const marked = (name: string, ttl: string) => ({ ...host(name, { value: field }), cache_control: { type: "ephemeral", ttl } });
+
+    await send({
+      tools: [marked("zeta_tool", "1h"), marked("alpha_tool", "5m")],
+      system: [{ type: "text", text: "agent", cache_control: five }],
+      messages: [{ role: "user", content: "hi" }],
+    });
+    await send({
+      cache_control: five,
+      system: [{ type: "text", text: "s1", cache_control: five }, { type: "text", text: "s2", cache_control: five }],
+      messages: [
+        { role: "user", content: [{ type: "text", text: "u1", cache_control: five }] },
+        { role: "assistant", content: [{ type: "text", text: "a1" }] },
+        { role: "user", content: [{ type: "text", text: "u2", cache_control: five }] },
+      ],
+    });
+
+    assert.deepEqual(sentMarkers(bodies[0]!), ["1h zeta_tool", "5m agent"]);
+    assert.deepEqual(bodies[1]!.cache_control, five);
+    assert.deepEqual(sentMarkers(bodies[1]!), ["5m s1", "5m s2", "5m u2"]);
+  });
+});
+
 describe("host tool contracts", () => {
   it("preserves each mapped host schema and extra fields, including aliases", () => {
     const names: Record<string, string> = { bash: "Bash", read: "Read", glob: "Glob", grep: "Grep", edit: "Edit", write: "Write", webfetch: "WebFetch", todowrite: "TodoWrite", task: "Agent", skill: "Skill", question: "AskUserQuestion", plan_enter: "EnterPlanMode", plan_exit: "ExitPlanMode" };
@@ -99,7 +142,7 @@ describe("host tool contracts", () => {
     let sent: Record<string, unknown> = {};
     globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
       sent = JSON.parse(String(init?.body));
-      return new Response(events, { status: 200 });
+      return new Response(events, { status: 200, headers: { "content-type": "text/event-stream" } });
     }) as typeof fetch;
     const hooks = await plugin.server({ client: { auth: { set: async () => {} } } });
     const loaded = await hooks.auth.loader(async () => ({ type: "oauth", access: "token", refresh: "refresh", expires: Date.now() + 3_600_000 }), { models: {} }) as { fetch: typeof fetch };
