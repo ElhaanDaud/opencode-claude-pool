@@ -101,11 +101,9 @@ export const PARAM_SNAKE_TO_CAMEL: Record<string, Record<string, string>> = {
     // glob → include (Claude uses "glob", OpenCode uses "include")
     glob: "include",
   },
-  // Agent: Claude has model/run_in_background/isolation that OpenCode doesn't have.
-  // OpenCode has task_id/command that Claude doesn't have.
-  Agent: {
-    // All shared params have same names, no renaming needed
-  },
+  // Agent is sent with the active task tool's own schema (see
+  // adoptActiveToolDefinition), so its params need no renaming.
+  Agent: {},
   // WebFetch: Claude uses "prompt", OpenCode uses "format".
   // We strip "prompt" inbound and inject a default "format" so OpenCode's
   // webfetch tool receives a valid payload. Outbound does the reverse:
@@ -117,7 +115,9 @@ export const PARAM_SNAKE_TO_CAMEL: Record<string, Record<string, string>> = {
     // Item shape differs — handled specially (activeForm → priority per item)
   },
   Skill: {
-    skill: "name", // Claude sends "skill" (the name), OpenCode expects "name"
+    // The active skill tool's own schema is sent, so the model already uses
+    // "name"; this only catches a call made from Claude Code habit.
+    skill: "name",
   },
 };
 
@@ -137,9 +137,6 @@ export const PARAM_CAMEL_TO_SNAKE: Record<string, Record<string, string>> = {
   Grep: {
     include: "glob",
   },
-  Skill: {
-    name: "skill",
-  },
 };
 
 /**
@@ -148,6 +145,10 @@ export const PARAM_CAMEL_TO_SNAKE: Record<string, Record<string, string>> = {
  * Inbound (Claude → OpenCode) and outbound (OpenCode → Claude) are kept
  * explicit rather than derived because they're not perfect inverses:
  * both OpenCode "build" and "general" map to Claude "general-purpose".
+ *
+ * On OpenCode 1 the model is shown the active task tool's own agent list, so
+ * inbound only catches a Claude Code name used from habit and history is left
+ * alone. The outbound map serves OpenCode 2, which still sends Claude's Agent.
  */
 export const AGENT_TYPE_CLAUDE_TO_OPENCODE: Record<string, string> = {
   "general-purpose": "general",
@@ -169,6 +170,10 @@ export const AGENT_TYPE_OPENCODE_TO_CLAUDE: Record<string, string> = {
  * schema but not in OpenCode's Zod schema — Zod in non-strict mode would
  * silently drop them, but we drop them explicitly so behavior is
  * independent of OpenCode's validation mode.
+ *
+ * A field the active tool declares is never stripped: a plugin may replace a
+ * built-in with a richer one (OhMyOpenCode's grep takes output_mode and
+ * head_limit), and dropping it there silently changes what the call does.
  */
 const INBOUND_FIELDS_TO_STRIP: Record<string, string[]> = {
   // run_in_background is NOT stripped: OpenCode task tools that support
@@ -192,7 +197,11 @@ const INBOUND_FIELDS_TO_STRIP: Record<string, string[]> = {
  * (e.g. a TodoWrite item whose content literally says 'activeForm',
  * or a Bash command with "file_path=..." inside a heredoc).
  */
-export function translateToolArgsJsonString(json: string, toolName: string): string {
+export function translateToolArgsJsonString(
+  json: string,
+  toolName: string,
+  declared?: ReadonlySet<string>,
+): string {
   let obj: unknown;
   try {
     obj = JSON.parse(json);
@@ -220,7 +229,9 @@ export function translateToolArgsJsonString(json: string, toolName: string): str
   // 2. Strip Claude-only fields OpenCode doesn't accept.
   const stripFields = INBOUND_FIELDS_TO_STRIP[toolName];
   if (stripFields) {
-    for (const field of stripFields) delete out[field];
+    for (const field of stripFields) {
+      if (!declared?.has(field)) delete out[field];
+    }
   }
 
   // 3. Tool-specific deeper translations.
@@ -293,13 +304,9 @@ export function translateArgsOpencodeToClaude(
     }
   }
 
-  // 2. Agent: translate OpenCode subagent_type values → Claude values.
-  if (toolName === "Agent") {
-    if (typeof out.subagent_type === "string") {
-      const mapped = AGENT_TYPE_OPENCODE_TO_CLAUDE[out.subagent_type];
-      if (mapped) out.subagent_type = mapped;
-    }
-  }
+  // 2. Agent and Skill are sent with the active tool's own schema and agent
+  //    catalog, so their history stays as OpenCode recorded it: renaming
+  //    "explore" to "Explore" would show the model a name its tool never listed.
 
   // 3. TodoWrite: OpenCode { priority, status∈{…,cancelled} } → Claude
   //    { activeForm, status∈{pending,in_progress,completed} }.
@@ -985,43 +992,37 @@ export const STUB_TOOL_NAMES = new Set(STUB_TOOLS.map((t) => t.name));
 export const SHARED_TOOL_NAMES = new Set(SHARED_TOOLS.map((t) => t.name));
 
 /**
- * Merge the active OpenCode `task` tool's extra schema into Claude's Agent
- * definition. Claude's wire schema only knows description/prompt/subagent_type/
- * model/run_in_background/isolation; OpenCode task tools (OMO) also declare
- * category, load_skills, task_id and command, and relax `required`. Keeping
- * Claude's wording for the shared fields leaves a stock OpenCode task
- * byte-identical on the wire while exposing the extra fields the model needs.
+ * Claude tools whose definition the host generates: OpenCode's `task` lists the
+ * agents (and, with OhMyOpenCode, the categories and skills) that exist in this
+ * setup, and `skill` lists the installed skills and commands. Claude Code builds
+ * the same two descriptions per install too, so nothing on the wire is fixed.
  */
-export function mergeAgentSchemaWithActiveTask(
-  claudeAgent: ToolDefinition,
-  activeTaskSchema: Record<string, unknown> | undefined,
+export const HOST_DEFINED_TOOL_NAMES = new Set(["Agent", "Skill"]);
+
+/**
+ * Send a host-defined tool under Claude's name but with the active tool's own
+ * description and schema. Claude's captured Agent text names agents that don't
+ * exist here and offers `model` and `isolation`, which no OpenCode task accepts;
+ * the active definition is the only one that describes what a call will do.
+ */
+export function adoptActiveToolDefinition(
+  claudeTool: ToolDefinition,
+  active: { name: string; description?: unknown; input_schema?: Record<string, unknown> },
 ): ToolDefinition {
-  const activeProps = activeTaskSchema
-    && typeof activeTaskSchema.properties === "object"
-    && activeTaskSchema.properties !== null
-    ? activeTaskSchema.properties as Record<string, unknown>
+  const own = typeof active.description === "string" && active.description.trim() !== ""
+    ? active.description
     : undefined;
-  if (!activeProps) return claudeAgent;
-
-  const claudeProps = (claudeAgent.input_schema.properties ?? {}) as Record<string, unknown>;
-  const mergedProps: Record<string, unknown> = { ...claudeProps };
-  for (const [key, def] of Object.entries(activeProps)) {
-    if (!(key in mergedProps)) mergedProps[key] = def;
-  }
-
-  const activeRequired = Array.isArray(activeTaskSchema!.required)
-    ? (activeTaskSchema!.required as unknown[]).filter((x): x is string => typeof x === "string")
-    : undefined;
-
+  // The agent prompt calls the tool by OpenCode's name ("task(...)"); a wire
+  // name that differs by more than case needs saying once.
+  const renamed = active.name.toLowerCase() !== claudeTool.name.toLowerCase();
   return {
-    ...claudeAgent,
-    input_schema: {
-      ...claudeAgent.input_schema,
-      properties: mergedProps,
-      required: activeRequired && activeRequired.length > 0
-        ? activeRequired
-        : claudeAgent.input_schema.required,
-    },
+    name: claudeTool.name,
+    description: own === undefined
+      ? claudeTool.description
+      : renamed
+      ? `Your instructions call this tool \`${active.name}\`: ${active.name}(...) means a call to this tool.\n\n${own}`
+      : own,
+    input_schema: active.input_schema ?? claudeTool.input_schema,
   };
 }
 

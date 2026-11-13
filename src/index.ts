@@ -34,7 +34,8 @@ import {
   computeFingerprint,
   extractFirstUserMessageText,
   shouldUseClaudeToolSchemas,
-  mergeAgentSchemaWithActiveTask,
+  adoptActiveToolDefinition,
+  HOST_DEFINED_TOOL_NAMES,
   scrubAbsentToolReferences,
 } from "./claude-tools.js";
 import type { ToolDefinition } from "./claude-tools.js";
@@ -400,8 +401,12 @@ export function getClaudeToolsForActiveOpenCodeTools(
     if (claudeName && !names.has(claudeName)) {
       const claudeTool = claudeToolsByName.get(claudeName);
       if (!claudeTool) continue;
-      const def = claudeName === "Agent"
-        ? mergeAgentSchemaWithActiveTask(claudeTool, getToolInputSchema(tool))
+      const def = HOST_DEFINED_TOOL_NAMES.has(claudeName)
+        ? adoptActiveToolDefinition(claudeTool, {
+          name,
+          description: (tool as { description?: unknown }).description,
+          input_schema: getToolInputSchema(tool),
+        })
         : claudeTool;
       selectedToolsByName.set(claudeName, def);
       coreNames.add(claudeName);
@@ -432,6 +437,26 @@ export function getClaudeToolsForActiveOpenCodeTools(
   const selected = Array.from(selectedToolsByName.values())
     .map((tool) => isCore(tool) ? scrubAbsentToolReferences(tool, coreNames) : tool);
   return [...selected.filter(isCore).sort(byName), ...selected.filter((t) => !isCore(t)).sort(byName)];
+}
+
+/**
+ * Claude tool name → the input fields the active OpenCode tool behind it
+ * declares, so the response translation keeps what that tool really accepts.
+ */
+export function getDeclaredFieldsForActiveOpenCodeTools(
+  tools: unknown,
+): Record<string, ReadonlySet<string>> {
+  const declared: Record<string, ReadonlySet<string>> = {};
+  if (!Array.isArray(tools)) return declared;
+  const inbound = getInboundToolNameMapForActiveOpenCodeTools(tools);
+  for (const tool of tools) {
+    const name = getToolName(tool);
+    const claudeName = name ? ACTIVE_TOOL_SCHEMA_NAME_MAP[name] : undefined;
+    if (!claudeName || inbound[claudeName] !== name) continue;
+    const properties = getToolInputSchema(tool)?.properties;
+    if (properties && typeof properties === "object") declared[claudeName] = new Set(Object.keys(properties));
+  }
+  return declared;
 }
 
 export function getInboundToolNameMapForActiveOpenCodeTools(
@@ -967,6 +992,8 @@ export interface PreparedRequest {
   ownsUserId: boolean;
   /** Claude tool name → OpenCode tool name, for translating the response stream. */
   inboundToolNameMap: Record<string, string>;
+  /** Claude tool name → fields the active OpenCode tool declares; never stripped from its calls. */
+  declaredToolFields: Record<string, ReadonlySet<string>>;
 }
 
 /**
@@ -1006,11 +1033,13 @@ export async function prepareRequest(
   const userIdFor = (token: string) => buildUserId(token, deviceId, sessionId);
   let ownsUserId = false;
 
-  let body = init?.body !== undefined ? init.body
+  // A null init.body keeps the Request's own body, as new Request(input, init) does.
+  let body = init?.body != null ? init.body
     : input instanceof Request && input.body ? await input.clone().text() : undefined;
   // Replaced by the active tools' map below; with no tools array there is no
   // custom tool to collide with, so every built-in keeps its Claude name.
   let inboundToolNameMap = INBOUND_TOOL_NAME_MAP;
+  let declaredToolFields: Record<string, ReadonlySet<string>> = {};
   if (body && typeof body === "string") {
     try {
       const parsed = JSON.parse(body);
@@ -1133,6 +1162,7 @@ export async function prepareRequest(
       if (opts.claudeTools) {
         if (shouldInjectClaudeTools({ model: parsed.model, requestUrl, tools: parsed.tools })) {
           inboundToolNameMap = getInboundToolNameMapForActiveOpenCodeTools(parsed.tools);
+          declaredToolFields = getDeclaredFieldsForActiveOpenCodeTools(parsed.tools);
           parsed.tools = getClaudeToolsForActiveOpenCodeTools(parsed.tools);
           if (parsed.tool_choice?.type === "tool") {
             const wireName = mapOutboundToolName(parsed.tool_choice.name);
@@ -1155,8 +1185,8 @@ export async function prepareRequest(
               if (!wireName || inboundToolNameMap[wireName] !== block.name) continue;
               block.name = wireName;
               // Consolidated OpenCode → Claude argument translation:
-              // key renames, Agent/AskUserQuestion/Skill/WebFetch/TodoWrite
-              // field bridging. Mirrors translateToolArgsJsonString
+              // key renames, AskUserQuestion/WebFetch/TodoWrite field
+              // bridging. Mirrors translateToolArgsJsonString
               // (inbound) so round-trips preserve meaning. See
               // translateArgsOpencodeToClaude in claude-tools.ts.
               if (block.input && typeof block.input === "object") {
@@ -1202,7 +1232,7 @@ export async function prepareRequest(
 
   const outHeaders: Record<string, string> = {};
   headers.forEach((v, k) => { outHeaders[k] = v; });
-  return { finalUrl, outHeaders, body, ownsUserId, inboundToolNameMap };
+  return { finalUrl, outHeaders, body, ownsUserId, inboundToolNameMap, declaredToolFields };
 }
 
 export interface SettleInput {
@@ -1690,7 +1720,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
             const prepared = await prepareRequest(input, init, accessToken, {
               sessionId, deviceId, claudeTools: true, ensureClaudePrefix: false,
             });
-            const { finalUrl, outHeaders, inboundToolNameMap } = prepared;
+            const { finalUrl, outHeaders, inboundToolNameMap, declaredToolFields } = prepared;
             let { body } = prepared;
             const method = init?.method ?? (input instanceof Request ? input.method : "POST");
             const signal = init?.signal !== undefined ? init.signal : input instanceof Request ? input.signal : undefined;
@@ -1795,7 +1825,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
               translateSseStream(response.body, {
                 inboundToolNameMap,
                 translateToolArgs: (json, name) => inboundToolNameMap[name]
-                  ? translateToolArgsJsonString(json, name) : json,
+                  ? translateToolArgsJsonString(json, name, declaredToolFields[name]) : json,
                 debug: (msg) => console.error(`[opencode-claude-bridge] stream: ${msg}`),
               }),
               { status: response.status, statusText: response.statusText, headers: response.headers },

@@ -646,38 +646,46 @@ describe("tool schema selection", () => {
     assert.deepEqual(out, ["Bash", "Read"]);
   });
 
-  it("merges an OMO task tool's extra fields into the Agent schema", () => {
-    const [agent] = getClaudeToolsForActiveOpenCodeTools([
-      {
-        name: "task",
-        description: "OMO task",
-        input_schema: {
-          type: "object",
-          properties: {
-            prompt: { type: "string" },
-            category: { type: "string" },
-            load_skills: { type: "array", items: { type: "string" } },
-            subagent_type: { type: "string" },
-          },
-          required: ["prompt"],
+  it("sends the active task tool's own description and schema as Agent", () => {
+    const task = {
+      name: "task",
+      description: "OMO task: categories quick, deep; agents explore, oracle",
+      input_schema: {
+        type: "object",
+        properties: {
+          prompt: { type: "string" },
+          category: { type: "string" },
+          load_skills: { type: "array", items: { type: "string" } },
+          subagent_type: { type: "string" },
         },
+        required: ["prompt"],
       },
-    ]);
-    const props = (agent.input_schema as any).properties;
+    };
+    const [agent] = getClaudeToolsForActiveOpenCodeTools([task]);
     assert.equal(agent.name, "Agent");
-    assert.ok(props.category, "category merged in");
-    assert.ok(props.load_skills, "load_skills merged in");
-    assert.ok(props.description, "Claude's own fields preserved");
-    assert.deepEqual((agent.input_schema as any).required, ["prompt"]);
+    assert.ok(agent.description.endsWith(task.description));
+    assert.match(agent.description, /`task`/);
+    assert.deepEqual(agent.input_schema, task.input_schema);
   });
 
-  it("leaves the Agent schema at Claude's wire shape when task declares no extras", () => {
+  it("advertises no Agent or Skill option the active tool lacks", () => {
+    const tools = getClaudeToolsForActiveOpenCodeTools([
+      { name: "task", description: "t", input_schema: { type: "object", properties: { prompt: { type: "string" } } } },
+      { name: "skill", description: "s", input_schema: { type: "object", properties: { name: { type: "string" } } } },
+    ]);
+    const props = (name: string) => Object.keys((tools.find((tool) => tool.name === name)!.input_schema as any).properties);
+    assert.deepEqual(props("Agent"), ["prompt"]);
+    assert.deepEqual(props("Skill"), ["name"]);
+    assert.equal(tools.find((tool) => tool.name === "Skill")!.description, "s");
+  });
+
+  it("falls back to Claude's definition when the active tool has none of its own", () => {
     const [agent] = getClaudeToolsForActiveOpenCodeTools([{ name: "task" }]);
     assert.deepEqual(
       (agent.input_schema as any).required,
       ["description", "prompt", "subagent_type"],
     );
-    assert.ok(!("category" in (agent.input_schema as any).properties));
+    assert.match(agent.description, /^Launch a new agent/);
   });
 
   it("scrubs Glob/Grep pointers from Bash when those tools are absent", () => {
@@ -768,6 +776,15 @@ describe("translateToolArgsJsonString", () => {
     const command = 'cat heredoc <<EOF\n{"file_path": "inside/string"}\nEOF';
     const out = translated("Bash", { command });
     assert.deepEqual(out, { command });
+  });
+
+  it("keeps fields the active tool declares, and still strips the rest", () => {
+    const call = { pattern: "x", output_mode: "content", head_limit: 5, "-i": true };
+    assert.deepEqual(translated("Grep", call), { pattern: "x" });
+    assert.deepEqual(
+      JSON.parse(translateToolArgsJsonString(JSON.stringify(call), "Grep", new Set(["pattern", "output_mode", "head_limit"]))),
+      { pattern: "x", output_mode: "content", head_limit: 5 },
+    );
   });
 
   it("maps Agent subagent_type values", () => {
@@ -949,11 +966,14 @@ describe("translateArgsOpencodeToClaude", () => {
     });
   });
 
-  it("maps OpenCode subagent_type values back to Claude", () => {
-    assert.equal(translateArgsOpencodeToClaude("Agent", { subagent_type: "general" }).subagent_type, "general-purpose");
-    assert.equal(translateArgsOpencodeToClaude("Agent", { subagent_type: "build" }).subagent_type, "general-purpose");
-    assert.equal(translateArgsOpencodeToClaude("Agent", { subagent_type: "explore" }).subagent_type, "Explore");
-    assert.equal(translateArgsOpencodeToClaude("Agent", { subagent_type: "plan" }).subagent_type, "Plan");
+  it("keeps the agent and skill names the active tools advertise in history", () => {
+    for (const agent of ["general", "build", "explore", "plan", "oracle"]) {
+      assert.equal(translateArgsOpencodeToClaude("Agent", { subagent_type: agent }).subagent_type, agent);
+    }
+    assert.deepEqual(
+      translateArgsOpencodeToClaude("Skill", { name: "git-master", user_message: "amend" }),
+      { name: "git-master", user_message: "amend" },
+    );
   });
 
   it("preserves Agent continuation fields in history", () => {
@@ -967,7 +987,7 @@ describe("translateArgsOpencodeToClaude", () => {
     assert.deepEqual(out, {
       description: "d",
       prompt: "p",
-      subagent_type: "general-purpose",
+      subagent_type: "general",
       task_id: "t_1",
       command: "go",
     });

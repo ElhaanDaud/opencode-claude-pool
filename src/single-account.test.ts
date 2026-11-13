@@ -146,6 +146,23 @@ describe("single-account retry", () => {
     assert.equal(sent?.signal, controller.signal);
   });
 
+  it("keeps a Request's body when init.body is null, as new Request(request, init) does", async () => {
+    let sent: RequestInit | undefined;
+    globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+      sent = init;
+      return new Response(OK.body, { status: 200 });
+    }) as typeof fetch;
+    const hooks = await plugin.server({ client: { auth: { set: async () => {} } } });
+    const loaded = await hooks.auth.loader(
+      async () => ({ type: "oauth", access: "token", refresh: "refresh", expires: Date.now() + 3_600_000 }),
+      { models: {} },
+    ) as { fetch: typeof fetch };
+    const request = new Request("https://api.anthropic.com/v1/messages", { method: "POST", body: JSON.stringify(plain) });
+    assert.equal(await new Request(request.clone(), { body: null }).text(), JSON.stringify(plain));
+    await loaded.fetch(request, { body: null });
+    assert.equal(JSON.parse(String(sent?.body)).model, plain.model);
+  });
+
   it("retries a 529 and returns the recovered response", async () => {
     const { status, sent } = await send(
       [{ status: 529, headers: { "retry-after": "0" } }, OK],
@@ -368,6 +385,93 @@ describe("request body rewrite", () => {
     assert.deepEqual(messages[0]!.content[0]!.input, args);
     const delta = text.split("\n").filter((line) => line.startsWith("data: ")).map((line) => JSON.parse(line.slice(6))).find((event) => event.type === "content_block_delta");
     assert.deepEqual(JSON.parse(delta.delta.partial_json), args);
+  });
+  it("sends the host's own task, skill and grep capabilities and routes them unchanged", async () => {
+    const task = {
+      name: "task",
+      description: "Spawn agent task with category-based or direct agent selection.\n  Available categories:\n  - quick: Trivial tasks\n  - subagent_type: Use specific agent directly (explore, librarian, oracle, metis, momus)\n  task(category=\"quick\", prompt=\"...\")",
+      input_schema: {
+        type: "object",
+        properties: {
+          load_skills: { type: "array", items: { type: "string" } },
+          description: { type: "string" },
+          prompt: { type: "string" },
+          run_in_background: { type: "boolean" },
+          category: { type: "string" },
+          subagent_type: { type: "string" },
+          task_id: { type: "string" },
+          command: { type: "string" },
+        },
+        required: ["prompt"],
+      },
+    };
+    const skill = {
+      name: "skill",
+      description: "Load a skill or execute a slash command.\n<available_items>\n- git-master: commits and history\n- /publish: release\n</available_items>",
+      input_schema: {
+        type: "object",
+        properties: { name: { type: "string" }, user_message: { type: "string" } },
+        required: ["name"],
+      },
+    };
+    const grep = {
+      name: "grep",
+      description: "Fast content search tool with safety limits",
+      input_schema: {
+        type: "object",
+        properties: {
+          pattern: { type: "string" }, include: { type: "string" }, path: { type: "string" },
+          output_mode: { type: "string" }, head_limit: { type: "number" },
+        },
+        required: ["pattern"],
+      },
+    };
+    const calls = [
+      { name: "Agent", input: { category: "quick", load_skills: ["git-master"], prompt: "p", run_in_background: true } },
+      { name: "Skill", input: { name: "publish", user_message: "patch" } },
+      { name: "Grep", input: { pattern: "x", glob: "*.ts", output_mode: "content", head_limit: 5, "-i": true } },
+    ];
+    const events = calls.flatMap((call, index) => [
+      { type: "content_block_start", index, content_block: { type: "tool_use", id: `t${index}`, name: call.name, input: {} } },
+      { type: "content_block_delta", index, delta: { type: "input_json_delta", partial_json: JSON.stringify(call.input) } },
+      { type: "content_block_stop", index },
+    ]).map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join("");
+    const history = [
+      { type: "tool_use", id: "a", name: "task", input: { subagent_type: "explore", load_skills: [], prompt: "find", task_id: "ses_1" } },
+      { type: "tool_use", id: "b", name: "skill", input: { name: "git-master", user_message: "amend" } },
+    ];
+
+    const { sent, text } = await send([{ status: 200, body: events }], {
+      ...plain, tools: [task, skill, grep],
+      messages: [{ role: "assistant", content: history }],
+    });
+
+    const tools = sent[0]!.tools as Array<{ name: string; description: string; input_schema: { properties: Record<string, unknown> } }>;
+    const agent = tools.find((tool) => tool.name === "Agent")!;
+    assert.ok(agent.description.endsWith(task.description), "the host's delegation guidance is sent");
+    assert.match(agent.description, /`task`/, "says which name the instructions use for it");
+    assert.doesNotMatch(agent.description, /general-purpose|statusline-setup/);
+    assert.deepEqual(agent.input_schema, task.input_schema);
+    const skillTool = tools.find((tool) => tool.name === "Skill")!;
+    assert.equal(skillTool.description, skill.description);
+    assert.deepEqual(skillTool.input_schema, skill.input_schema);
+
+    const messages = sent[0]!.messages as Array<{ content: Array<{ name: string; input: unknown }> }>;
+    assert.deepEqual(messages[0]!.content.map(({ name, input }) => ({ name, input })), [
+      { name: "Agent", input: history[0]!.input },
+      { name: "Skill", input: history[1]!.input },
+    ]);
+
+    const data = text.split("\n").filter((line) => line.startsWith("data: ")).map((line) => JSON.parse(line.slice(6)));
+    const received = data.filter((event) => event.type === "content_block_start").map((event) => ({
+      name: event.content_block.name,
+      input: JSON.parse(data.find((delta) => delta.type === "content_block_delta" && delta.index === event.index).delta.partial_json),
+    }));
+    assert.deepEqual(received, [
+      { name: "task", input: calls[0]!.input },
+      { name: "skill", input: calls[1]!.input },
+      { name: "grep", input: { pattern: "x", include: "*.ts", output_mode: "content", head_limit: 5 } },
+    ]);
   });
   it("keeps OpenCode's system blocks after Claude Code's prompt", async () => {
     const { sent } = await send([OK], {

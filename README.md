@@ -156,7 +156,7 @@ Claude Code sends 26 captured core tools (plus user-specific MCP tools). OpenCod
 
 The bridge resolves this by:
 
-1. **Replacing active OpenCode shared core tool definitions only for Claude-compatible targets** with Claude Code's exact wire-captured definitions — matching descriptions, JSON schemas, parameter names, and required fields.
+1. **Replacing active OpenCode shared core tool definitions only for Claude-compatible targets** with Claude Code's exact wire-captured definitions — matching descriptions, JSON schemas, parameter names, and required fields. `task` and `skill` are the exception: they go out under Claude's names (`Agent`, `Skill`) but keep the active tool's own description and schema, because that text is generated per setup — OpenCode's agent list, and with OhMyOpenCode its categories, skills and commands. Claude Code's captured Agent text names agents that don't exist in OpenCode and offers `model` and `isolation`, which no OpenCode task accepts.
 2. **Preserving active OpenCode custom/MCP tool definitions** so project-specific MCP servers remain available to Claude models.
 3. **Selecting Claude-only alias/stub schemas only when the matching OpenCode tool is active** (for example `question` → `AskUserQuestion`, `plan_enter` → `EnterPlanMode`).
 4. **Ordering Claude core tools first, then custom/MCP tools**, each group alphabetical, to match Claude Code's ordering and keep the request prefix byte-stable for prompt caching.
@@ -197,9 +197,10 @@ Claude Code and OpenCode use different parameter naming conventions. The bridge 
 
 Additional shared-tool bridging handled by the bridge:
 
-- `Agent` / `task` — defaults missing `subagent_type` to `general`, strips unsupported Claude-only fields inbound, and strips OpenCode-only history fields outbound
+- `Agent` / `task` — sent with the active task tool's schema, so calls and history pass through as they are; a call with neither `subagent_type` nor `category` defaults to `general`
 - `AskUserQuestion` / `question` — maps `multiSelect` <-> `multiple`
-- `Skill` — maps `skill` <-> `name`
+- `Skill` — sent with the active skill tool's schema (`name`); a call using Claude Code's `skill` is renamed to `name`
+- A Claude-only argument is dropped only when the active tool doesn't declare it: OhMyOpenCode's `grep` takes `output_mode` and `head_limit`, so those reach it; stock OpenCode's doesn't, so they are dropped
 - `WebFetch` — best-effort bridge between Claude's `prompt` and OpenCode's `format` by using `markdown` inbound and synthesizing a Claude prompt outbound
 
 ### Agent type translation
@@ -213,7 +214,7 @@ Claude Code uses different agent/subagent types than OpenCode:
 | `Plan` | `plan` |
 | `statusline-setup` | `build` |
 
-These are mapped in both directions — inbound responses and outbound historical messages.
+The model is shown OpenCode's own agent names, in the active task tool's description. A Claude Code name it uses anyway is mapped on the way in; history keeps OpenCode's names. OpenCode 2 still sends Claude's Agent definition and maps both directions.
 
 ### TodoWrite status mapping
 
