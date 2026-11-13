@@ -167,6 +167,21 @@ describe("rotation manager activation", () => {
     await Promise.all([refreshing, enrolling]);
     assert.equal((await h.accounts.getAccount("alice"))?.oauth.refresh, "new-refresh");
   });
+  it("keeps an account a writer outside the lock replaced mid-refresh, and sets its result aside", async (t) => {
+    const h = harness(t, [record("alice", { expires: NOW - 1 })]);
+    const manager = createRotationManager({
+      accounts: h.accounts, state: h.state, journalPath: h.journalPath,
+      clock: () => NOW, mirrorFn: async () => {},
+      refreshFn: async () => {
+        await h.accounts.putAccount(record("alice", { access: "outside", refresh: "outside-refresh" }));
+        return { access: "fresh", refresh: "fresh-refresh", expires: NOW + 3_600_000 };
+      },
+    });
+    assert.equal((await manager.refreshLabel("alice")).refresh, "outside-refresh");
+    assert.equal((await h.accounts.getAccount("alice"))?.oauth.refresh, "outside-refresh");
+    const aside = fs.readdirSync(path.dirname(h.journalPath)).filter((name) => name.endsWith(".stale"));
+    assert.equal(JSON.parse(fs.readFileSync(path.join(path.dirname(h.journalPath), aside[0]!), "utf8")).tokens.refresh, "fresh-refresh");
+  });
   it("does not refresh when a stale journal cannot be quarantined", async (t) => {
     const h = harness(t, [record("alice", { expires: NOW - 1 })]);
     const journal = JSON.stringify({ label: "removed", tokens: { access: "a", refresh: "r", expires: NOW }, writtenAt: NOW });

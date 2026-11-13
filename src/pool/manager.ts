@@ -363,6 +363,14 @@ export function createRotationManager(opts: ManagerOptions) {
             }`,
           );
         }
+        // Read-compare-write, not an atomic swap: every writer in this package
+        // holds the lock, but one that doesn't (a hand edit, an old version)
+        // could still land after this check. Its login is kept, ours set aside.
+        const latest = await accounts.getAccount(label);
+        if (latest && latest.oauth.refresh !== current.oauth.refresh) {
+          setAsideJournal(label, "account replaced during the refresh");
+          return latest.oauth;
+        }
         await accounts.updateTokens(label, fresh);
         clearJournal();
 

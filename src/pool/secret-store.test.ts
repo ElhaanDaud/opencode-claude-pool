@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { chmodSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -263,29 +265,45 @@ describe("file backend", () => {
 describe("keychain backend (macOS only)", { skip: process.platform !== "darwin" }, () => {
   const service = `opencode-bridge-test-${process.pid}-${Date.now()}`;
 
-  it("round-trips, updates, and reports absent items as missing", async () => {
-    const backend = createKeychainBackend(service);
-    const value = JSON.stringify({ token: `quote " apostrophe ' space`, n: 1 });
+  async function withKeychain(test: (backend: SecretBackend) => Promise<void>): Promise<void> {
+    const dir = mkdtempSync(join(tmpdir(), "bridge-keychain-"));
+    const keychain = join(dir, "test.keychain-db");
+    const password = randomBytes(32).toString("hex");
+    let created = false;
     try {
+      execFileSync("security", ["create-keychain", "-p", password, keychain], { stdio: "ignore", timeout: 5000 });
+      created = true;
+      execFileSync("security", ["unlock-keychain", "-p", password, keychain], { stdio: "ignore", timeout: 5000 });
+      execFileSync("security", ["set-keychain-settings", keychain], { stdio: "ignore", timeout: 5000 });
+      await test(createKeychainBackend(service, keychain));
+    } finally {
+      try {
+        if (created) execFileSync("security", ["delete-keychain", keychain], { stdio: "ignore", timeout: 5000 });
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  }
+
+  it("round-trips, updates, and reports absent items as missing", async () => {
+    await withKeychain(async (backend) => {
+      const value = JSON.stringify({ token: `quote " apostrophe ' space`, n: 1 });
       assert.equal(await backend.get("acct"), null);
       await backend.set("acct", value);
       assert.equal(await backend.get("acct"), value);
+      assert.deepEqual(await backend.list(), ["acct"]);
       await backend.set("acct", "second");
       assert.equal(await backend.get("acct"), "second");
-    } finally {
       await backend.remove("acct");
-    }
-    assert.equal(await backend.get("acct"), null);
+      assert.equal(await backend.get("acct"), null);
+    });
   });
 
   it("refuses an oversized value rather than storing a truncated secret", async () => {
-    const backend = createKeychainBackend(service);
-    try {
+    await withKeychain(async (backend) => {
       await backend.set("big", "original");
       await assert.rejects(backend.set("big", "x".repeat(4000)));
       assert.equal(await backend.get("big"), "original");
-    } finally {
-      await backend.remove("big");
-    }
+    });
   });
 });

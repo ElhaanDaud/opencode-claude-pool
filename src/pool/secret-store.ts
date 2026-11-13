@@ -122,7 +122,9 @@ export function parseKeychainLabels(output: string, service: string): string[] {
 
 export function createKeychainBackend(
   service = POOL_KEYCHAIN_SERVICE,
+  keychainFile?: string,
 ): SecretBackend {
+  const keychainArgs = keychainFile === undefined ? [] : [keychainFile];
   return {
     async get(label: string): Promise<string | null> {
       try {
@@ -133,6 +135,7 @@ export function createKeychainBackend(
           "-a",
           label,
           "-w",
+          ...keychainArgs,
         ]);
         return output.endsWith("\n") ? output.slice(0, -1) : output;
       } catch (error) {
@@ -147,7 +150,8 @@ export function createKeychainBackend(
         const hex = Buffer.from(value, "utf8").toString("hex");
         await runSecurityCommand(
           `add-generic-password -U -s ${quoteForSecurity(service)} -a ${quoteForSecurity(label)}`
-            + ` -l ${quoteForSecurity(`${service}:${label}`)} -D "Claude account pool entry" -X ${hex}`,
+            + ` -l ${quoteForSecurity(`${service}:${label}`)} -D "Claude account pool entry" -X ${hex}`
+            + (keychainFile === undefined ? "" : ` ${quoteForSecurity(keychainFile)}`),
         );
       } catch {
         throw new Error(`Failed to store keychain account "${label}"`);
@@ -162,6 +166,7 @@ export function createKeychainBackend(
           service,
           "-a",
           label,
+          ...keychainArgs,
         ]);
       } catch (error) {
         if (!isMissingKeychainItem(error)) {
@@ -172,7 +177,7 @@ export function createKeychainBackend(
 
     async list(): Promise<string[]> {
       try {
-        return parseKeychainLabels(await runSecurity(["dump-keychain"]), service);
+        return parseKeychainLabels(await runSecurity(["dump-keychain", ...keychainArgs]), service);
       } catch {
         throw new Error(`Failed to list keychain service "${service}"`);
       }

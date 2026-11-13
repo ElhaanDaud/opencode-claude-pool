@@ -452,6 +452,26 @@ describe("rotation state locking", () => {
     });
     assert.equal(entered, true);
   });
+
+  it("does not release a lock it cannot prove is its own", async (t) => {
+    const statePath = tempStatePath(t);
+    const lockPath = `${statePath}.lock`;
+    const store = createRotationStateStore({ path: statePath, lockPollMs: 1 });
+
+    // Our lock was reclaimed and a replacement created but not yet written.
+    await store.withLock(() => {
+      fs.writeFileSync(lockPath, "");
+    });
+    assert.equal(fs.readFileSync(lockPath, "utf8"), "");
+
+    fs.writeFileSync(lockPath, JSON.stringify({ pid: 1, hostname: os.hostname(), acquiredAt: 0, nonce: "theirs" }));
+    const replacement = fs.readFileSync(lockPath, "utf8");
+    fs.rmSync(lockPath);
+    await store.withLock(() => {
+      fs.writeFileSync(lockPath, replacement);
+    });
+    assert.equal(fs.readFileSync(lockPath, "utf8"), replacement);
+  });
 });
 
 describe("rotation state mutators", () => {

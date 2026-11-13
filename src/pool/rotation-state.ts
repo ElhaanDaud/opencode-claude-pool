@@ -354,10 +354,11 @@ export function createRotationStateStore(opts: RotationStateStoreOptions) {
   }
 
   function release(nonce: string): void {
-    // Only release a lock we still own. If ours was reclaimed from under us,
-    // deleting it would evict whoever legitimately holds it now.
-    const current = readLock();
-    if (current && current.nonce !== nonce) return;
+    // Only release a lock that provably still holds our nonce. If ours was
+    // reclaimed from under us, deleting it would evict whoever holds it now,
+    // and that includes a replacement still being written: it reads as
+    // unparseable, not as someone else's.
+    if (readLock()?.nonce !== nonce) return;
     try { fs.rmSync(lockPath, { force: true }); } catch { /* best effort */ }
   }
 
