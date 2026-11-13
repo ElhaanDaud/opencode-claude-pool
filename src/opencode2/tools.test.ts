@@ -311,13 +311,30 @@ describe("wrapV2Response", () => {
     assert.deepEqual(await firstToolUse(wrapped), { name: "patch", input: { patchText: "x" } });
   });
 
-  it("returns the same response for errors, non-SSE bodies and an empty map", async () => {
+  it("returns errors and an empty map untouched, and non-event bodies byte for byte", async () => {
     const error = new Response("{}", { status: 429, headers: { "content-type": "text/event-stream" } });
     assert.equal(wrapV2Response(error, MAP), error);
-    const json = new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
-    assert.equal(wrapV2Response(json, MAP), json);
+    const plain = '{"name":"Bash"}\n\nnot an event';
+    const text = new Response(plain, { status: 200, headers: { "content-type": "text/plain" } });
+    assert.equal(await wrapV2Response(text, MAP).text(), plain);
     const stream = sse("x");
     assert.equal(wrapV2Response(stream, {}), stream);
+  });
+
+  it("translates successful JSON messages using the V2 tool mapping", async () => {
+    const message = { type: "message", content: [{ type: "text", text: '"name":"Bash" mcp_Foo' }, { type: "tool_use", name: "Write", input: { file_path: "/x", content: '"name":"Bash" mcp_Foo' } }] };
+    const response = new Response(JSON.stringify(message), { headers: { "content-type": "application/json", "content-length": "123", "x-test": "ok" } });
+    const wrapped = wrapV2Response(response, MAP);
+    assert.equal(wrapped.headers.get("content-length"), null);
+    assert.equal(wrapped.headers.get("x-test"), "ok");
+    assert.deepEqual(await wrapped.json(), { type: "message", content: [message.content[0], { type: "tool_use", name: "write", input: { path: "/x", content: '"name":"Bash" mcp_Foo' } }] });
+  });
+
+  it("passes malformed JSON and error responses unchanged", async () => {
+    const malformed = new Response("{bad", { headers: { "content-type": "application/json" } });
+    assert.equal(await wrapV2Response(malformed, MAP).text(), "{bad");
+    const error = new Response("{bad", { status: 400, headers: { "content-type": "application/json" } });
+    assert.equal(wrapV2Response(error, MAP), error);
   });
 
   it("keeps status and headers on a wrapped response", () => {

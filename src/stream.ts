@@ -80,6 +80,18 @@ export type StreamProcessorDeps = {
   debug?: (msg: string) => void;
 };
 
+// Large Write calls are legitimate, but model output is bounded by max_tokens.
+export const MAX_TOOL_INPUT_BYTES = 16 * 1024 * 1024;
+export const MAX_SSE_FRAME_BYTES = 16 * 1024 * 1024;
+export const MAX_JSON_MESSAGE_BYTES = 16 * 1024 * 1024;
+
+const byteLength = (text: string) => Buffer.byteLength(text, "utf8");
+const safeToolName = (name: string) => /^[a-zA-Z0-9_.-]{1,128}$/.test(name) ? name : "unknown";
+
+function errorEvent(message: string): string {
+  return buildSseEvent("error", JSON.stringify({ type: "error", error: { type: "api_error", message } }));
+}
+
 /**
  * Create a stateful SSE processor.
  *
@@ -93,11 +105,19 @@ export type StreamProcessorDeps = {
  * normally ends on a blank line, so this is typically empty).
  */
 export function createSseProcessor(deps: StreamProcessorDeps) {
-  type ToolBlockState = { toolName: string; partialJson: string };
+  type ToolBlockState = { toolName: string; partialJson: string; bytes: number };
   const toolBlocks = new Map<number, ToolBlockState>();
   let sseBuffer = "";
   // The last chunk ended in "\r", so a leading "\n" completes that CRLF.
   let afterCR = false;
+  let failed = false;
+
+  function fail(message: string): string {
+    failed = true;
+    sseBuffer = "";
+    toolBlocks.clear();
+    return errorEvent(message);
+  }
 
   // Event types that require peeking into the JSON to decide whether/how to
   // mutate. Every other event type is a pure pass-through — no need to
@@ -136,6 +156,11 @@ export function createSseProcessor(deps: StreamProcessorDeps) {
     const rec = obj as Record<string, any>;
     const type = rec.type as string | undefined;
 
+    if (type === "content_block_start" && Number.isSafeInteger(rec.index)) {
+      const existing = toolBlocks.get(rec.index);
+      if (existing) return fail(`Duplicate tool index ${rec.index} for ${safeToolName(existing.toolName)}`);
+    }
+
     // content_block_start with tool_use: translate name, register per-index state
     if (
       type === "content_block_start" &&
@@ -145,10 +170,11 @@ export function createSseProcessor(deps: StreamProcessorDeps) {
     ) {
       const idx = rec.index as number;
       const claudeName: string = rec.content_block.name || "";
+      if (!Number.isSafeInteger(idx) || idx < 0) return fail(`Invalid tool index for ${safeToolName(claudeName)}`);
       const mapped = deps.inboundToolNameMap[claudeName] || claudeName;
       rec.content_block.name = mapped;
       if (rec.content_block.input === undefined) rec.content_block.input = {};
-      toolBlocks.set(idx, { toolName: claudeName, partialJson: "" });
+      toolBlocks.set(idx, { toolName: claudeName, partialJson: "", bytes: 0 });
       return buildSseEvent(event, JSON.stringify(rec));
     }
 
@@ -160,9 +186,14 @@ export function createSseProcessor(deps: StreamProcessorDeps) {
       rec.delta.type === "input_json_delta"
     ) {
       const idx = rec.index as number;
+      if (!Number.isSafeInteger(idx) || idx < 0) return fail("Invalid tool delta index for unknown tool");
       const state = toolBlocks.get(idx);
       if (state) {
-        state.partialJson += String(rec.delta.partial_json ?? "");
+        const fragment = String(rec.delta.partial_json ?? "");
+        const size = state.bytes + byteLength(fragment);
+        if (size > MAX_TOOL_INPUT_BYTES) return fail(`Tool input limit ${MAX_TOOL_INPUT_BYTES} bytes exceeded: ${size} bytes for ${safeToolName(state.toolName)}`);
+        state.bytes = size;
+        state.partialJson += fragment;
         return "";
       }
       return block;
@@ -172,6 +203,7 @@ export function createSseProcessor(deps: StreamProcessorDeps) {
     // input_json_delta containing the fully translated JSON, then emit the stop.
     if (type === "content_block_stop") {
       const idx = rec.index as number;
+      if ((!Number.isSafeInteger(idx) || idx < 0) && toolBlocks.size > 0) return fail("Invalid content block stop index for unknown tool");
       const state = toolBlocks.get(idx);
       if (state) {
         toolBlocks.delete(idx);
@@ -201,6 +233,7 @@ export function createSseProcessor(deps: StreamProcessorDeps) {
   }
 
   function feedChunk(text: string): string {
+    if (failed) return "";
     // SSE allows CRLF, LF or CR line endings; frame and parse on LF only.
     const skip = afterCR && text.startsWith("\n") ? 1 : 0;
     if (text) afterCR = text.endsWith("\r");
@@ -208,15 +241,22 @@ export function createSseProcessor(deps: StreamProcessorDeps) {
     let out = "";
     while (true) {
       const boundary = sseBuffer.indexOf("\n\n");
+      const frameSize = byteLength(boundary === -1 ? sseBuffer : sseBuffer.slice(0, boundary + 2));
+      if (frameSize > MAX_SSE_FRAME_BYTES) {
+        const tool = toolBlocks.values().next().value as ToolBlockState | undefined;
+        return out + fail(`SSE frame limit ${MAX_SSE_FRAME_BYTES} bytes exceeded: ${frameSize} bytes for ${safeToolName(tool?.toolName ?? "unknown")}`);
+      }
       if (boundary === -1) break;
       const block = sseBuffer.slice(0, boundary + 2);
       sseBuffer = sseBuffer.slice(boundary + 2);
       out += processEvent(block);
+      if (failed) break;
     }
     return out;
   }
 
   function flush(): string {
+    if (failed) return "";
     const remaining = sseBuffer;
     sseBuffer = "";
     afterCR = false;
@@ -227,10 +267,11 @@ export function createSseProcessor(deps: StreamProcessorDeps) {
       // completed args. Surface it so the operator isn't debugging a
       // ghost.
       const orphaned = Array.from(toolBlocks.entries()).map(
-        ([idx, s]) => `index=${idx} tool=${s.toolName} bufferedBytes=${s.partialJson.length}`,
+        ([idx, s]) => `index=${idx} tool=${safeToolName(s.toolName)} bufferedBytes=${s.bytes}`,
       );
       deps.debug?.(`flush: ${toolBlocks.size} tool_use block(s) abandoned mid-stream: ${orphaned.join("; ")}`);
-      toolBlocks.clear();
+      const state = toolBlocks.values().next().value as ToolBlockState;
+      return fail(`Truncated tool input for ${safeToolName(state.toolName)}: ${state.bytes} bytes buffered`);
     }
     return remaining;
   }
@@ -242,7 +283,70 @@ export function createSseProcessor(deps: StreamProcessorDeps) {
     toolBlocks.clear();
   }
 
-  return { feedChunk, flush, discard, pendingToolBlocks: () => toolBlocks.size };
+  return { feedChunk, flush, discard, pendingToolBlocks: () => toolBlocks.size, failed: () => failed };
+}
+
+export function translateJsonMessage(body: string, deps: StreamProcessorDeps): string {
+  if (byteLength(body) > MAX_JSON_MESSAGE_BYTES) {
+    return JSON.stringify({ type: "error", error: { type: "api_error", message: `JSON message limit ${MAX_JSON_MESSAGE_BYTES} bytes exceeded` } });
+  }
+  try {
+    const message = JSON.parse(body);
+    if (!message || message.type !== "message" || !Array.isArray(message.content)) return body;
+    for (const block of message.content) {
+      if (!block || block.type !== "tool_use" || typeof block.name !== "string" || !(block.name in deps.inboundToolNameMap)) continue;
+      const name = block.name;
+      const input = JSON.stringify(block.input);
+      if (byteLength(input) > MAX_TOOL_INPUT_BYTES) {
+        return JSON.stringify({ type: "error", error: { type: "api_error", message: `Tool input limit ${MAX_TOOL_INPUT_BYTES} bytes exceeded: ${byteLength(input)} bytes for ${safeToolName(name)}` } });
+      }
+      block.input = JSON.parse(deps.translateToolArgs(input, name));
+      block.name = deps.inboundToolNameMap[name];
+    }
+    return JSON.stringify(message);
+  } catch {
+    deps.debug?.("translateJsonMessage: invalid JSON or tool input; passed through unchanged");
+    return body;
+  }
+}
+
+export function translateJsonResponse(response: Response, deps: StreamProcessorDeps): Response {
+  if (!response.body) return response;
+  const reader = response.body.getReader();
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
+  let cancelled = false;
+  const body = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      let size = 0;
+      let text = "";
+      try {
+        while (!cancelled) {
+          const result = await reader.read();
+          if (cancelled) return;
+          if (result.done) {
+            controller.enqueue(encoder.encode(translateJsonMessage(text + decoder.decode(), deps)));
+            controller.close();
+            return;
+          }
+          size += result.value.byteLength;
+          if (size > MAX_JSON_MESSAGE_BYTES) {
+            controller.enqueue(encoder.encode(JSON.stringify({ type: "error", error: { type: "api_error", message: `JSON message limit ${MAX_JSON_MESSAGE_BYTES} bytes exceeded: ${size} bytes for unknown tool` } })));
+            controller.close();
+            void reader.cancel().catch(() => {});
+            return;
+          }
+          text += decoder.decode(result.value, { stream: true });
+        }
+      } catch (error) {
+        if (!cancelled) controller.error(error);
+      }
+    },
+    cancel(reason) { cancelled = true; return reader.cancel(reason); },
+  });
+  const headers = new Headers(response.headers);
+  headers.delete("content-length");
+  return new Response(body, { status: response.status, statusText: response.statusText, headers });
 }
 
 /** OpenCode 1 aborts a stream after 300s without bytes by default (chunkTimeout). */
@@ -307,6 +411,13 @@ export function translateSseStream(
             return;
           }
           emit(processor.feedChunk(decoder.decode(value, { stream: true })));
+          if (processor.failed()) {
+            clearInterval(timer);
+            cancelled = true;
+            void reader.cancel().catch(() => {});
+            controller.close();
+            return;
+          }
         }
       } catch (e) {
         clearInterval(timer);
