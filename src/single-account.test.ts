@@ -4,6 +4,7 @@
  */
 
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
@@ -24,10 +25,12 @@ Object.defineProperty(process, "platform", { value: "linux" });
 // TOKEN_URL is read at import time.
 const liveRefreshTokens = new Set<string>();
 const refreshRequests: string[] = [];
+let tokenDelayMs = 0;
 const tokenServer = http.createServer((req, res) => {
   let raw = "";
   req.on("data", (chunk) => { raw += chunk; });
-  req.on("end", () => {
+  req.on("end", async () => {
+    if (tokenDelayMs) await new Promise((resolve) => setTimeout(resolve, tokenDelayMs));
     const token = String(JSON.parse(raw).refresh_token);
     refreshRequests.push(token);
     res.setHeader("content-type", "application/json");
@@ -44,7 +47,7 @@ await new Promise<void>((resolve) => tokenServer.listen(0, "127.0.0.1", resolve)
 process.env.ANTHROPIC_TOKEN_URL = `http://127.0.0.1:${(tokenServer.address() as AddressInfo).port}/v1/oauth/token`;
 after(() => tokenServer.close());
 
-const { default: plugin } = await import("./index.js");
+const { default: plugin, fetchUpstream, prepareRequest } = await import("./index.js");
 const { getResponseRetryDelayMs, getTokenRetryDelayMs, parseRetryAfterMs } = await import("./retry.js");
 
 type Reply = { status: number; body?: string; headers?: Record<string, string> };
@@ -204,7 +207,7 @@ type StoredAuth = { type: string; access: string; refresh: string; expires: numb
 /** A loaded fetch whose getAuth() re-reads `store`, as OpenCode's does; `status` answers each bearer. */
 async function connect(
   store: { auth: StoredAuth },
-  save: (body: StoredAuth) => Promise<void>,
+  save: (body: StoredAuth) => Promise<unknown>,
   status: (bearer: string) => number = () => 200,
 ) {
   const bearers: string[] = [];
@@ -227,8 +230,20 @@ async function connect(
     await response.text();
     return response.status;
   };
-  return { call, bearers };
+  return { call, bearers, loaded };
 }
+
+/** Records `refresh` as a login OpenCode made itself, which only the bridge refreshes. */
+function ownedByBridge(refresh: string) {
+  const dir = path.join(home, ".local", "share", "opencode-claude-bridge");
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, "single-account-owner.json"),
+    JSON.stringify({ bridge: [createHash("sha256").update(refresh).digest("hex")] }),
+  );
+}
+
+const journalPath = () => path.join(home, ".local", "share", "opencode-claude-bridge", "single-account-journal.json");
 
 /** Logs the Claude CLI in with tokens valid for an hour. */
 function cliLogin(access: string, refresh: string) {
@@ -260,8 +275,9 @@ describe("single-account refresh", () => {
     assert.equal(response.status, 200);
     assert.deepEqual(sent, [{ bearer: "Bearer identity-a", uuid: "uuid-a" }, { bearer: "Bearer identity-b", uuid: "uuid-b" }]);
   });
-  it("shares one refresh between concurrent requests", async () => {
+  it("shares one refresh of a login OpenCode owns between concurrent requests", async () => {
     liveRefreshTokens.add("shared");
+    ownedByBridge("shared");
     const store = { auth: { type: "oauth", access: "old", refresh: "shared", expires: Date.now() - 1000 } };
     const { call, bearers } = await connect(store, async (body) => { store.auth = body; });
     const before = refreshRequests.length;
@@ -271,8 +287,9 @@ describe("single-account refresh", () => {
     assert.deepEqual(bearers, ["Bearer shared/access", "Bearer shared/access"]);
   });
 
-  it("keeps tokens whose save failed, and saves them on the next request", async () => {
+  it("journals tokens whose save failed, and saves them on the next request", async () => {
     liveRefreshTokens.add("unsaved");
+    ownedByBridge("unsaved");
     const store = { auth: { type: "oauth", access: "old", refresh: "unsaved", expires: Date.now() - 1000 } };
     let failures = 1;
     const { call, bearers } = await connect(store, async (body) => {
@@ -283,28 +300,67 @@ describe("single-account refresh", () => {
 
     assert.equal(await call(), 200);
     assert.equal(store.auth.refresh, "unsaved");
+    assert.equal(JSON.parse(fs.readFileSync(journalPath(), "utf8")).tokens.refresh, "unsaved/next");
     assert.equal(await call(), 200);
     assert.deepEqual(refreshRequests.slice(before), ["unsaved"]);
     assert.deepEqual(bearers, ["Bearer unsaved/access", "Bearer unsaved/access"]);
     assert.equal(store.auth.refresh, "unsaved/next");
+    assert.equal(fs.existsSync(journalPath()), false);
   });
 
-  it("refreshes a rejected token the Claude CLI also holds, and resends", async () => {
-    // Plugin init copies the CLI login into the store, so both hold one token.
+  it("keeps the journal when OpenCode refuses the save, which its SDK reports without throwing", async (t) => {
+    liveRefreshTokens.add("refused");
+    ownedByBridge("refused");
+    const store = { auth: { type: "oauth", access: "old", refresh: "refused", expires: Date.now() - 1000 } };
+    const logged: string[] = [];
+    t.mock.method(console, "error", (message: unknown) => { logged.push(String(message)); });
+    let refusals = 1;
+    const { call, bearers } = await connect(store, async (body) => {
+      // What OpenCode's SDK resolves for a rejected write; its message echoes the payload.
+      if (refusals-- > 0) return { error: { name: "BadRequest", data: { message: `Expected Auth, got ${JSON.stringify(body)}` } } };
+      store.auth = body;
+      return undefined;
+    });
+    const before = refreshRequests.length;
+
+    assert.equal(await call(), 200);
+    assert.equal(store.auth.refresh, "refused");
+    assert.equal(JSON.parse(fs.readFileSync(journalPath(), "utf8")).tokens.refresh, "refused/next");
+    assert.equal(await call(), 200);
+    assert.equal(store.auth.refresh, "refused/next");
+    assert.equal(fs.existsSync(journalPath()), false);
+    assert.deepEqual(refreshRequests.slice(before), ["refused"]);
+    assert.deepEqual(bearers, ["Bearer refused/access", "Bearer refused/access"]);
+    assert.ok(logged.some((line) => line.includes("[redacted]")));
+    assert.ok(!logged.some((line) => line.includes("refused/next") || line.includes("refused/access")));
+  });
+
+  it("never refreshes Claude Code's login, even after a 401, and says how to get a fresh one", async () => {
     liveRefreshTokens.add("copied-refresh");
     cliLogin("copied", "copied-refresh");
     const store = { auth: { type: "oauth", access: "copied", refresh: "copied-refresh", expires: Date.now() + 3_600_000 } };
     const { call, bearers } = await connect(store, async (body) => { store.auth = body; }, refreshedOnly);
     const before = refreshRequests.length;
 
-    assert.equal(await call(), 200);
-    assert.deepEqual(refreshRequests.slice(before), ["copied-refresh"]);
-    assert.deepEqual(bearers, ["Bearer copied", "Bearer copied-refresh/access"]);
+    assert.equal(await call(), 401);
+    assert.deepEqual(refreshRequests.slice(before), []);
+    assert.deepEqual(bearers, ["Bearer copied"]);
+    assert.equal(liveRefreshTokens.has("copied-refresh"), true);
+  });
+
+  it("does not refresh a login whose owner was never recorded", async () => {
+    liveRefreshTokens.add("unknown-refresh");
+    const store = { auth: { type: "oauth", access: "old", refresh: "unknown-refresh", expires: Date.now() - 1000 } };
+    const { call } = await connect(store, async (body) => { store.auth = body; });
+    const before = refreshRequests.length;
+
+    assert.equal(await call(), 401);
+    assert.deepEqual(refreshRequests.slice(before), []);
   });
 
   it("shares one refresh between concurrent requests whose token was rejected", async () => {
     liveRefreshTokens.add("twice-refresh");
-    cliLogin("twice", "twice-refresh");
+    ownedByBridge("twice-refresh");
     const store = { auth: { type: "oauth", access: "twice", refresh: "twice-refresh", expires: Date.now() + 3_600_000 } };
     const { call, bearers } = await connect(store, async (body) => { store.auth = body; }, refreshedOnly);
     const before = refreshRequests.length;
@@ -314,27 +370,39 @@ describe("single-account refresh", () => {
     assert.deepEqual([...bearers].sort(), ["Bearer twice", "Bearer twice", "Bearer twice-refresh/access", "Bearer twice-refresh/access"]);
   });
 
-  it("takes no rejected token back from a refresh already in flight", async () => {
-    liveRefreshTokens.add("early");
-    const store = { auth: { type: "oauth", access: "old", refresh: "early", expires: Date.now() - 1000 } };
+  it("keeps a login OpenCode owns on its own account instead of borrowing the CLI's", async () => {
+    liveRefreshTokens.add("own-refresh");
+    ownedByBridge("own-refresh");
+    const store = { auth: { type: "oauth", access: "own", refresh: "own-refresh", expires: Date.now() + 3_600_000 } };
+    const { call, bearers } = await connect(store, async (body) => { store.auth = body; }, refreshedOnly);
+    cliLogin("cli-other", "cli-other-refresh");
+
+    assert.equal(await call(), 200);
+    assert.deepEqual(bearers, ["Bearer own", "Bearer own-refresh/access"]);
+  });
+
+  it("lets a cancelled request go without losing the refresh it started", async () => {
+    liveRefreshTokens.add("slow-refresh");
+    ownedByBridge("slow-refresh");
+    const store = { auth: { type: "oauth", access: "old", refresh: "slow-refresh", expires: Date.now() - 1000 } };
     let saved!: () => void;
     const saving = new Promise<void>((resolve) => { saved = resolve; });
-    let open!: () => void;
-    const gate = new Promise<void>((resolve) => { open = resolve; });
-    // The first save lands in the store, then hangs until the CLI's token is rejected.
-    const { call, bearers } = await connect(store, async (body) => { store.auth = body; saved(); await gate; }, (bearer) => {
-      if (bearer === "Bearer cli-race") setTimeout(open);
-      return refreshedOnly(bearer);
-    });
-    cliLogin("cli-race", "cli-race-refresh");
-    const before = refreshRequests.length;
-
-    // The first request's refresh takes the CLI's token; the second sends it and is rejected.
-    const first = call();
-    await saving;
-    assert.deepEqual(await Promise.all([first, call()]), [200, 200]);
-    assert.deepEqual(refreshRequests.slice(before), ["early"]);
-    assert.deepEqual(bearers, ["Bearer cli-race", "Bearer early/access", "Bearer early/access"]);
+    const { loaded } = await connect(store, async (body) => { store.auth = body; saved(); });
+    tokenDelayMs = 200;
+    try {
+      const controller = new AbortController();
+      const request = loaded.fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST", body: JSON.stringify(plain), signal: controller.signal,
+      });
+      setTimeout(() => controller.abort(new Error("cancelled")), 20);
+      const started = Date.now();
+      await assert.rejects(request, /cancelled/);
+      assert.ok(Date.now() - started < 150, "the caller stops waiting at once");
+      await saving;
+      assert.equal(store.auth.refresh, "slow-refresh/next");
+    } finally {
+      tokenDelayMs = 0;
+    }
   });
 
   it("resends on the Claude CLI's other valid token without spending a refresh token", async () => {
@@ -348,6 +416,31 @@ describe("single-account refresh", () => {
     assert.deepEqual(refreshRequests.slice(before), []);
     assert.deepEqual(bearers, ["Bearer stale", "Bearer relogged"]);
     assert.equal(store.auth.access, "relogged");
+  });
+});
+
+describe("startup seeding", () => {
+  function storedLogin(auth: StoredAuth) {
+    const dir = path.join(home, ".local", "share", "opencode");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "auth.json"), JSON.stringify({ anthropic: auth }));
+  }
+
+  it("copies Claude Code's login over a login nobody owns", async () => {
+    storedLogin({ type: "oauth", access: "a", refresh: "a-refresh", expires: Date.now() + 3_600_000 });
+    cliLogin("cli", "cli-refresh");
+    const saves: StoredAuth[] = [];
+    await plugin.server({ client: { auth: { set: async ({ body }: { body: Record<string, unknown> }) => { saves.push(body as StoredAuth); } } } });
+    assert.deepEqual(saves.map((auth) => auth.refresh), ["cli-refresh"]);
+  });
+
+  it("never overwrites a login OpenCode owns", async () => {
+    storedLogin({ type: "oauth", access: "own", refresh: "own-refresh", expires: Date.now() + 3_600_000 });
+    ownedByBridge("own-refresh");
+    cliLogin("cli", "cli-refresh");
+    const saves: StoredAuth[] = [];
+    await plugin.server({ client: { auth: { set: async ({ body }: { body: Record<string, unknown> }) => { saves.push(body as StoredAuth); } } } });
+    assert.deepEqual(saves, []);
   });
 });
 
@@ -542,7 +635,7 @@ describe("request body rewrite", () => {
     });
   });
 
-  it("ends an assistant-tailed request on a user turn and keeps the tail cache marker", async () => {
+  it("ends an assistant-tailed request on a user turn and keeps the host's cache markers", async () => {
     const marker = { type: "ephemeral" };
     const { sent } = await send([OK], {
       ...plain,
@@ -553,7 +646,7 @@ describe("request body rewrite", () => {
     });
     const messages = sent[0]!.messages as Array<{ role: string; content: Array<{ cache_control?: unknown }> | string }>;
     assert.equal(messages.at(-1)!.role, "user");
-    assert.equal("cache_control" in (messages[0]!.content as Array<object>)[0]!, false);
+    assert.deepEqual((messages[0]!.content as Array<{ cache_control?: unknown }>)[0]!.cache_control, marker);
     assert.deepEqual((messages[1]!.content as Array<{ cache_control?: unknown }>)[0]!.cache_control, marker);
   });
 
@@ -569,6 +662,235 @@ describe("request body rewrite", () => {
     });
     const messages = sent[0]!.messages as Array<{ content: Array<{ text: string }> }>;
     assert.deepEqual(messages.map((message) => message.content[0]!.text), texts);
+  });
+});
+
+describe("request policy", () => {
+  async function loadPlugin() {
+    const hooks = await plugin.server({ client: { auth: { set: async () => {} } } });
+    return await hooks.auth.loader(
+      async () => ({ type: "oauth", access: "token", refresh: "refresh", expires: Date.now() + 3_600_000 }),
+      { models: {} },
+    ) as { fetch: typeof fetch };
+  }
+
+  it("sends the login to no origin but Anthropic's unless it is trusted", async () => {
+    const targets: string[] = [];
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      targets.push(String(url));
+      return new Response(OK.body, { status: 200 });
+    }) as typeof fetch;
+    const loaded = await loadPlugin();
+    const refused = await loaded.fetch("https://proxy.example/v1/messages", { method: "POST", body: JSON.stringify(plain) });
+    assert.equal(refused.status, 400);
+    assert.match(await refused.text(), /ANTHROPIC_TRUSTED_ORIGINS=https:\/\/proxy\.example/);
+    assert.deepEqual(targets, []);
+
+    process.env.ANTHROPIC_TRUSTED_ORIGINS = "https://proxy.example";
+    try {
+      assert.equal((await loaded.fetch("https://proxy.example/v1/messages", { method: "POST", body: JSON.stringify(plain) })).status, 200);
+    } finally {
+      delete process.env.ANTHROPIC_TRUSTED_ORIGINS;
+    }
+    assert.equal(new URL(targets[0]!).origin, "https://proxy.example");
+  });
+
+  it("sends at most the API's 4 cache markers, even when the tools carry them", async () => {
+    globalThis.fetch = (async () => new Response("{}", { status: 404 })) as typeof fetch;
+    const marker = { type: "ephemeral" };
+    const tools = ["one", "two", "three", "four", "five"].map((name) => ({
+      name, description: "", input_schema: { type: "object", properties: {} }, cache_control: marker,
+    }));
+    const prepared = await prepareRequest("https://api.anthropic.com/v1/messages", {
+      method: "POST", body: JSON.stringify({ ...plain, tools }),
+    }, "token", { sessionId: "s", deviceId: "d", claudeTools: true, ensureClaudePrefix: false });
+    const sent = JSON.parse(String(prepared.body)) as { tools: object[]; system: object[]; messages: Array<{ content: unknown }> };
+    const blocks = [...sent.tools, ...sent.system, ...sent.messages.flatMap((m) => (Array.isArray(m.content) ? m.content : []))];
+    assert.equal(blocks.filter((block) => "cache_control" in block).length, 4);
+    const change = prepared.settingChanges.find((c) => c.setting === "cache_control");
+    assert.deepEqual([change?.from, change?.to], ["5 markers", "4 markers"]);
+  });
+
+  it("hands a redirect back instead of following it with the login", async () => {
+    globalThis.fetch = realFetch;
+    const seen: Array<string | undefined> = [];
+    const other = http.createServer((req, res) => { seen.push(req.headers.authorization); res.end("{}"); });
+    await new Promise<void>((resolve) => other.listen(0, "127.0.0.1", resolve));
+    const first = http.createServer((_req, res) => {
+      res.writeHead(307, { location: `http://127.0.0.1:${(other.address() as AddressInfo).port}/steal` });
+      res.end();
+    });
+    await new Promise<void>((resolve) => first.listen(0, "127.0.0.1", resolve));
+    try {
+      const response = await fetchUpstream(`http://127.0.0.1:${(first.address() as AddressInfo).port}/v1/messages`, {
+        method: "POST", headers: { authorization: "Bearer secret" }, body: "{}",
+      });
+      assert.equal(response.status, 307);
+      assert.deepEqual(seen, []);
+    } finally {
+      first.close();
+      other.close();
+    }
+  });
+
+  it("keeps the caller's temperature instead of the bridge's default thinking, and records what it set", async () => {
+    const trace = path.join(home, "trace.jsonl");
+    process.env.ANTHROPIC_TRACE_PATH = trace;
+    try {
+      const { sent } = await send([OK], { ...plain, model: "claude-opus-4-6", temperature: 0.2 });
+      assert.equal(sent[0]!.temperature, 0.2);
+      assert.equal(sent[0]!.thinking, undefined);
+
+      await send([OK], { ...plain, model: "claude-opus-4-6" });
+      const lines = fs.readFileSync(trace, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+      assert.equal(lines.length, 2);
+      assert.deepEqual(lines[1].changes.map((c: { setting: string; reason: string }) => `${c.setting}:${c.reason}`).sort(), [
+        "context_management:default", "output_config.effort:default", "thinking:default",
+      ]);
+      assert.equal(lines[1].route, "https://api.anthropic.com/v1/messages");
+      assert.equal(lines[1].status, 200);
+      // No credential and no prompt text.
+      assert.doesNotMatch(fs.readFileSync(trace, "utf8"), /Bearer|"token"|"hi"/);
+    } finally {
+      delete process.env.ANTHROPIC_TRACE_PATH;
+    }
+  });
+});
+
+describe("retry and deadline accounting", () => {
+  /** Run backoff sleeps at once, recording what each one asked for. */
+  async function recordingWaits<T>(run: () => Promise<T>): Promise<{ result: T; waits: number[] }> {
+    const realSetTimeout = globalThis.setTimeout;
+    const waits: number[] = [];
+    globalThis.setTimeout = ((fn: () => void, ms = 0) => {
+      if (ms < 1000) return realSetTimeout(fn, ms);
+      waits.push(ms);
+      return realSetTimeout(fn, 0);
+    }) as typeof setTimeout;
+    try {
+      return { result: await run(), waits };
+    } finally {
+      globalThis.setTimeout = realSetTimeout;
+    }
+  }
+
+  /** A fetch answering `status` forever, recording sends and which bodies were disposed. */
+  function failingUpstream(status: number, headers: Record<string, string> = {}) {
+    const sent: number[] = [];
+    const disposed: number[] = [];
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      if (!String(url).includes("/v1/messages")) return new Response("{}", { status: 404 });
+      const n = sent.push(sent.length);
+      const body = new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode("{\"type\":\"error\"}"));
+          controller.close();
+        },
+        cancel() { disposed.push(n); },
+      });
+      return new Response(body, { status, headers });
+    }) as typeof fetch;
+    return { sent, disposed };
+  }
+
+  async function loaded() {
+    const hooks = await plugin.server({ client: { auth: { set: async () => {} } } });
+    return await hooks.auth.loader(
+      async () => ({ type: "oauth", access: "token", refresh: "refresh", expires: Date.now() + 3_600_000 }),
+      { models: {} },
+    ) as { fetch: typeof fetch };
+  }
+  const call = (fetcher: { fetch: typeof fetch }, signal?: AbortSignal) =>
+    fetcher.fetch("https://api.anthropic.com/v1/messages", { method: "POST", body: JSON.stringify(plain), signal });
+
+  it("spends one 10 s wait budget across every in-place retry", async () => {
+    const upstream = failingUpstream(429, { "retry-after": "6" });
+    const fetcher = await loaded();
+    const { result, waits } = await recordingWaits(() => call(fetcher));
+    assert.equal(result.status, 429);
+    // A second 6 s wait would overrun the budget, so the 429 goes back to OpenCode instead.
+    assert.deepEqual(waits, [6000]);
+    assert.equal(upstream.sent.length, 2);
+  });
+
+  it("disposes of every response it doesn't return", async () => {
+    const upstream = failingUpstream(529);
+    const fetcher = await loaded();
+    const { result } = await recordingWaits(() => call(fetcher));
+    assert.equal(result.status, 529);
+    assert.equal(upstream.sent.length, 1 + 2);
+    // Every response but the returned one was cancelled, so no connection is left open.
+    assert.deepEqual(upstream.disposed, [1, 2]);
+  });
+
+  it("bounds what the host's own retries multiply: each call sends at most 1 + 1 + 2", async () => {
+    const upstream = failingUpstream(529);
+    const fetcher = await loaded();
+    // OpenCode retries a 529 itself; three of its attempts reach the plugin.
+    await recordingWaits(async () => {
+      for (let attempt = 0; attempt < 3; attempt++) await (await call(fetcher)).text();
+    });
+    assert.equal(upstream.sent.length, 3 * 3);
+  });
+
+  it("stops retrying the moment the request is cancelled", async () => {
+    const upstream = failingUpstream(529);
+    const fetcher = await loaded();
+    const controller = new AbortController();
+    const request = call(fetcher, controller.signal);
+    setTimeout(() => controller.abort(new Error("cancelled")), 50);
+    await assert.rejects(request, /cancelled/);
+    await new Promise((resolve) => setTimeout(resolve, 2500));
+    assert.equal(upstream.sent.length, 1);
+  });
+
+  it("traces each retry and the sends it took, with no credential or prompt text", async () => {
+    failingUpstream(529);
+    const trace = path.join(home, "trace.jsonl");
+    process.env.ANTHROPIC_TRACE_PATH = trace;
+    try {
+      const fetcher = await loaded();
+      await recordingWaits(() => call(fetcher));
+      const [line] = fs.readFileSync(trace, "utf8").trim().split("\n").map((text) => JSON.parse(text));
+      assert.deepEqual(line.events.map((e: { kind: string; layer: string; status: number }) => `${e.kind}:${e.layer}:${e.status}`), ["retry:single:529", "retry:single:529"]);
+      assert.equal(line.sends, 3);
+      assert.equal(line.status, 529);
+      assert.doesNotMatch(fs.readFileSync(trace, "utf8"), /Bearer|"token"|"refresh"|"hi"/);
+    } finally {
+      delete process.env.ANTHROPIC_TRACE_PATH;
+    }
+  });
+
+  it("keeps serving when the trace can't be written, and says so once", async (t) => {
+    globalThis.fetch = (async () => new Response(OK.body, { status: 200 })) as typeof fetch;
+    const warnings: string[] = [];
+    t.mock.method(console, "error", (message: string) => { warnings.push(String(message)); });
+    process.env.ANTHROPIC_TRACE_PATH = path.join(home, "missing-dir", "trace.jsonl");
+    try {
+      const fetcher = await loaded();
+      assert.equal((await call(fetcher)).status, 200);
+      assert.equal((await call(fetcher)).status, 200);
+      assert.equal(warnings.filter((w) => w.includes("could not write the request trace")).length, 1);
+    } finally {
+      delete process.env.ANTHROPIC_TRACE_PATH;
+    }
+  });
+});
+
+describe("forced tool choice on a model that can't stop thinking", () => {
+  it("is dropped visibly: recorded as a compatibility change and warned about once", async (t) => {
+    globalThis.fetch = (async () => new Response("{}", { status: 404 })) as typeof fetch;
+    const warnings: string[] = [];
+    t.mock.method(console, "error", (message: string) => { warnings.push(String(message)); });
+    const body = JSON.stringify({ ...plain, model: "claude-sonnet-5-5-warning-probe", tool_choice: { type: "tool", name: "read" } });
+    const prepare = () => prepareRequest("https://api.anthropic.com/v1/messages", { method: "POST", body }, "token", {
+      sessionId: "s", deviceId: "d", claudeTools: false, ensureClaudePrefix: false,
+    });
+    const first = await prepare();
+    await prepare();
+    assert.equal(JSON.parse(String(first.body)).tool_choice, undefined);
+    assert.deepEqual(first.settingChanges.find((c) => c.setting === "tool_choice")?.reason, "compatibility");
+    assert.equal(warnings.filter((w) => w.includes("forced tool_choice")).length, 1);
   });
 });
 

@@ -31,12 +31,11 @@ import {
   rewriteSystemBlocksForModel,
   shouldInjectClaudeTools,
   stripAssistantPrefillForClaude,
-  stripMessageCacheControlPreservingTail,
   mergeClaudeSystemPrompt,
   normalizeSystemBlocks,
-  stripSystemCacheControl,
   supportsAdaptiveThinking,
 } from "./index.js";
+import { capturedBlocksToSend, captureProvenance, limitCacheBreakpoints, portableCapturedText } from "./request-policy.js";
 import { createSseProcessor, parseSseEvent, buildSseEvent } from "./stream.js";
 
 // Simulate the body-transform logic from the fetch wrapper
@@ -309,25 +308,82 @@ describe("Claude assistant prefill stripping", () => {
   });
 });
 
-describe("message cache_control", () => {
-  it("keeps the tail message's text breakpoint and strips earlier ones", () => {
-    const marker = { type: "ephemeral" };
-    const messages = [
-      { role: "user", content: [{ type: "text", text: "old", cache_control: marker }] },
-      { role: "assistant", content: [{ type: "text", text: "mid", cache_control: marker }] },
-      { role: "user", content: [{ type: "text", text: "tail", cache_control: marker }] },
-    ];
-    stripMessageCacheControlPreservingTail(messages);
-    assert.equal("cache_control" in messages[0]!.content[0]!, false);
-    assert.equal("cache_control" in messages[1]!.content[0]!, false);
-    assert.deepEqual(messages[2]!.content[0]!.cache_control, marker);
+describe("prompt-cache markers", () => {
+  const marker = { type: "ephemeral" };
+  it("keeps the host's markers when they are within the API's limit", () => {
+    const parsed = {
+      system: [{ type: "text", text: "billing" }, { type: "text", text: "agent", cache_control: marker }],
+      messages: [
+        { role: "user", content: [{ type: "text", text: "old", cache_control: marker }] },
+        { role: "user", content: [{ type: "text", text: "tail", cache_control: marker }] },
+      ],
+    };
+    assert.deepEqual(limitCacheBreakpoints(parsed), []);
+    assert.deepEqual(parsed.system[1]!.cache_control, marker);
+    assert.deepEqual(parsed.messages[0]!.content[0]!.cache_control, marker);
   });
 
-  it("leaves non-text blocks alone", () => {
-    const marker = { type: "ephemeral" };
-    const result = { type: "tool_result", tool_use_id: "t", content: "r", cache_control: marker };
-    stripMessageCacheControlPreservingTail([{ content: [result] }, { content: "tail" }]);
-    assert.deepEqual(result.cache_control, marker);
+  it("drops tool markers first, since any later marker caches the tools too", () => {
+    const parsed = {
+      tools: [1, 2, 3, 4, 5].map((n) => ({ name: `t${n}`, cache_control: marker })),
+      system: [{ type: "text", text: "agent", cache_control: marker }],
+      messages: [{ role: "user", content: [{ type: "text", text: "tail", cache_control: marker }] }],
+    };
+    const changes = limitCacheBreakpoints(parsed);
+    assert.deepEqual(parsed.tools.map((tool) => "cache_control" in tool), [false, false, false, true, true]);
+    assert.deepEqual(parsed.system[0]!.cache_control, marker);
+    assert.deepEqual(parsed.messages[0]!.content[0]!.cache_control, marker);
+    assert.deepEqual([changes[0]?.from, changes[0]?.to], ["7 markers", "4 markers"]);
+    assert.match(changes[0]!.note!, /3 tool markers/);
+  });
+
+  it("drops only the earliest markers past the limit, and says so", () => {
+    const parsed = {
+      system: [{ type: "text", text: "a", cache_control: marker }, { type: "text", text: "b", cache_control: marker }],
+      messages: [1, 2, 3].map((n) => ({ role: "user", content: [{ type: "text", text: `m${n}`, cache_control: marker }] })),
+    };
+    const changes = limitCacheBreakpoints(parsed);
+    assert.equal("cache_control" in parsed.messages[0]!.content[0]!, false);
+    assert.deepEqual(parsed.messages[2]!.content[0]!.cache_control, marker);
+    assert.deepEqual(parsed.system[0]!.cache_control, marker);
+    assert.equal(changes[0]?.reason, "compatibility");
+  });
+});
+
+describe("captured Claude Code prompt", () => {
+  it("sends only the sections that describe Claude Code, not the captured session", () => {
+    const text = [
+      "", "# Harness", " - generic rule", "", "# Session-specific guidance", " - that session's skills",
+      "", "# Memory", "You have memory at /Users/x/.claude/projects/-Users-x-other/memory/", "", "# Environment", " - models",
+    ].join("\n");
+    const out = portableCapturedText(text);
+    assert.match(out, /# Harness/);
+    assert.match(out, /# Environment/);
+    assert.doesNotMatch(out, /Memory|projects|that session/);
+  });
+
+  it("keeps a section out when its heading and its text are in different blocks", () => {
+    const sent = capturedBlocksToSend([
+      { type: "text", text: "# Harness\n - generic rule" },
+      { type: "text", text: "# Memory" },
+      { type: "text", text: "You have memory at /Users/x/.claude/projects/-Users-x-other/memory/" },
+      { type: "text", text: "# Environment\n - models" },
+    ]).map((block) => block.text).join("\n");
+    assert.match(sent, /# Harness/);
+    assert.match(sent, /# Environment/);
+    assert.doesNotMatch(sent, /Memory|projects/);
+  });
+
+  it("drops the capture's own cache markers", () => {
+    assert.deepEqual(
+      capturedBlocksToSend([{ type: "text", text: "identity", cache_control: { type: "ephemeral", ttl: "1h" } }]),
+      [{ type: "text", text: "identity" }],
+    );
+  });
+
+  it("reads the version a capture came from, old or new format", () => {
+    assert.deepEqual(captureProvenance({ billing: { ccVersion: "2.1.293.16f" }, updated_at: "2026-10-08" }), { cliVersion: "2.1.293", capturedAt: "2026-10-08" });
+    assert.deepEqual(captureProvenance({ provenance: { cliVersion: "2.1.323", capturedAt: "2026-11-13" } }), { cliVersion: "2.1.323", capturedAt: "2026-11-13" });
   });
 });
 
@@ -382,36 +438,9 @@ describe("system prompt merge", () => {
 });
 
 describe("system prompt without a captured Claude Code prompt", () => {
-  it("renames OpenCode as a word but not inside paths, URLs or names", () => {
-    const out = normalizeSystemBlocks([{
-      type: "text",
-      text: [
-        "You are OpenCode, the best coding agent on the planet.",
-        "For OpenCode's features see https://opencode.ai/docs or https://github.com/anomalyco/opencode.",
-        "Working directory: /Users/me/src/opencode-claude-bridge",
-        "Config: opencode.json, .opencode/, ~/.config/opencode/AGENTS.md, /Applications/OpenCode.app",
-        "Skills: customize-opencode, from OhMyOpenCode. Built for OpenCode.",
-      ].join("\n"),
-    }]);
-    assert.equal(out[0]?.text, [
-      "You are Claude Code, the best coding agent on the planet.",
-      "For Claude Code's features see https://opencode.ai/docs or https://github.com/anomalyco/opencode.",
-      "Working directory: /Users/me/src/opencode-claude-bridge",
-      "Config: opencode.json, .opencode/, ~/.config/opencode/AGENTS.md, /Applications/OpenCode.app",
-      "Skills: customize-opencode, from OhMyOpenCode. Built for Claude Code.",
-    ].join("\n"));
-  });
-});
-
-describe("system cache control", () => {
-  it("strips cache_control from system blocks", () => {
-    assert.deepEqual(stripSystemCacheControl([
-      { type: "text", text: "a", cache_control: { type: "ephemeral" } },
-      { type: "text", text: "b" },
-    ]), [
-      { type: "text", text: "a" },
-      { type: "text", text: "b" },
-    ]);
+  it("sends the host's text as written, OpenCode's name included", () => {
+    const text = "You are OpenCode, the best coding agent on the planet.\nSkills: from OhMyOpenCode. Built for OpenCode.";
+    assert.equal(normalizeSystemBlocks([{ type: "text", text }])[0]?.text, text);
   });
 });
 
@@ -513,13 +542,14 @@ describe("tool schema selection", () => {
     assert.deepEqual(out, ["Read", "context7_resolve-library-id", "headroom_retrieve"]);
   });
 
-  it("replaces mapped tools with the wire-captured Claude schema", () => {
+  it("uses the active host definition for mapped tools", () => {
     const [bash] = getClaudeToolsForActiveOpenCodeTools([
       { name: "bash", description: "opencode description", input_schema: {} },
     ]);
 
     assert.equal(bash.name, "Bash");
-    assert.notEqual(bash.description, "opencode description");
+    assert.equal(bash.description, "opencode description");
+    assert.deepEqual(bash.input_schema, {});
   });
 
   it("orders output deterministically regardless of input order", () => {
@@ -563,7 +593,7 @@ describe("tool schema selection", () => {
     const preservedTool = out.find((tool) => tool.name === customTool.name);
 
     assert.ok(bashTool);
-    assert.notEqual(bashTool.description, "OpenCode bash");
+    assert.equal(bashTool.description, "OpenCode bash");
     assert.deepEqual(preservedTool, customTool);
   });
 

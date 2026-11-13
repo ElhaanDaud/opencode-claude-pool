@@ -32,6 +32,7 @@ import { buildPoolBusyResponse, buildPoolExhaustedResponse } from "../pool/bridg
 import { createToaster } from "../pool/notify.js";
 import { applyClaudeToolsForV2, wrapV2Response } from "./tools.js";
 import { LockTimeoutError } from "../pool/rotation-state.js";
+import { isTrustedDestination, untrustedDestinationResponse } from "../request-policy.js";
 
 const PROVIDER_ID = "anthropic";
 const METHOD_ID = "claude-pro-max";
@@ -411,6 +412,12 @@ async function setup(ctx: V2Context): Promise<() => void> {
       if (active.methodID === METHOD_ID) own = active;
     }
 
+    // Checked before any credential is taken: the pool's must not reach it either.
+    if (!isTrustedDestination(original.url)) {
+      await stashResponse(event, untrustedDestinationResponse(original.url));
+      return;
+    }
+
     let accessToken: string;
     let label: string | null = null;
     if (await currentPoolActive()) {
@@ -471,7 +478,7 @@ async function setup(ctx: V2Context): Promise<() => void> {
       if (V2_HEADER.test(name)) delete prepared.outHeaders[name];
     }
     if (!isMessage) {
-      event.request = new Request(prepared.finalUrl, { method, headers: prepared.outHeaders, body, signal });
+      event.request = new Request(prepared.finalUrl, { method, headers: prepared.outHeaders, body, signal, redirect: "manual" });
       pending.skip(event.request);
       return;
     }
@@ -488,6 +495,8 @@ async function setup(ctx: V2Context): Promise<() => void> {
       headers: prepared.outHeaders,
       body: prepared.body,
       signal,
+      // Handed back, not followed: a redirect would carry the bearer along.
+      redirect: "manual",
     });
     pending.add(
       event,

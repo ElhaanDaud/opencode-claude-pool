@@ -222,7 +222,8 @@ export function translateToolArgsJsonString(
   if (keyMap && Object.keys(keyMap).length > 0) {
     out = {};
     for (const [k, v] of Object.entries(record)) {
-      out[keyMap[k] || k] = v;
+      const target = keyMap[k];
+      out[target && (!declared || (declared.has(target) && !declared.has(k))) ? target : k] = v;
     }
   }
 
@@ -236,10 +237,9 @@ export function translateToolArgsJsonString(
 
   // 3. Tool-specific deeper translations.
   if (toolName === "TodoWrite" && Array.isArray(out.todos)) {
-    // Claude: { content, status, activeForm }. OpenCode: { content, status, priority }.
-    // OpenCode's priority is typed as z.string() so the activeForm text works fine.
     for (const item of out.todos as Array<Record<string, unknown>>) {
-      if (item && typeof item === "object" && "activeForm" in item) {
+      if (item && typeof item === "object" && "activeForm" in item
+        && (!declared || (declared.has("todos[].priority") && !declared.has("todos[].activeForm")))) {
         item.priority = item.activeForm;
         delete item.activeForm;
       }
@@ -260,13 +260,14 @@ export function translateToolArgsJsonString(
   if (toolName === "AskUserQuestion" && Array.isArray(out.questions)) {
     // Claude uses "multiSelect", OpenCode's question tool uses "multiple".
     for (const item of out.questions as Array<Record<string, unknown>>) {
-      if (item && typeof item === "object" && "multiSelect" in item) {
+      if (item && typeof item === "object" && "multiSelect" in item
+        && (!declared || (declared.has("questions[].multiple") && !declared.has("questions[].multiSelect")))) {
         item.multiple = item.multiSelect;
         delete item.multiSelect;
       }
     }
   }
-  if (toolName === "WebFetch") {
+  if (toolName === "WebFetch" && !declared) {
     // OpenCode's webfetch takes a `format` field (markdown/text/html).
     // Default it to markdown if Claude didn't send one (it never does,
     // since Claude's WebFetch has no equivalent field).
@@ -274,7 +275,11 @@ export function translateToolArgsJsonString(
       out.format = "markdown";
     }
   }
-  if (toolName === "Agent" && typeof out.subagent_type !== "string" && typeof out.category !== "string") {
+  // Only for Claude's captured schema, which requires subagent_type. With the
+  // host's own schema the call goes as made: OMO answers a call naming neither
+  // category nor agent with an error the model can act on, where a default
+  // would silently run an agent nobody chose.
+  if (toolName === "Agent" && !declared && typeof out.subagent_type !== "string" && typeof out.category !== "string" && out.task_id === undefined) {
     // OpenCode's task tool needs subagent_type unless a category selects the
     // agent (OMO: providing both is rejected). Default only when neither given.
     out.subagent_type = "general";
@@ -997,7 +1002,7 @@ export const SHARED_TOOL_NAMES = new Set(SHARED_TOOLS.map((t) => t.name));
  * setup, and `skill` lists the installed skills and commands. Claude Code builds
  * the same two descriptions per install too, so nothing on the wire is fixed.
  */
-export const HOST_DEFINED_TOOL_NAMES = new Set(["Agent", "Skill"]);
+export const HOST_DEFINED_TOOL_NAMES = new Set([...SHARED_TOOL_NAMES, "AskUserQuestion", "EnterPlanMode", "ExitPlanMode"]);
 
 /**
  * Send a host-defined tool under Claude's name but with the active tool's own
@@ -1007,22 +1012,33 @@ export const HOST_DEFINED_TOOL_NAMES = new Set(["Agent", "Skill"]);
  */
 export function adoptActiveToolDefinition(
   claudeTool: ToolDefinition,
-  active: { name: string; description?: unknown; input_schema?: Record<string, unknown> },
+  active: { name: string; description?: unknown; input_schema?: Record<string, unknown>; [key: string]: unknown },
 ): ToolDefinition {
-  const own = typeof active.description === "string" && active.description.trim() !== ""
-    ? active.description
-    : undefined;
+  if (!active.input_schema) {
+    const strip = new Set(INBOUND_FIELDS_TO_STRIP[claudeTool.name] ?? []);
+    const schema = claudeTool.input_schema;
+    const properties = schema.properties;
+    return {
+      ...claudeTool,
+      input_schema: {
+        ...schema,
+        ...(properties && typeof properties === "object" && !Array.isArray(properties)
+          ? { properties: Object.fromEntries(Object.entries(properties).filter(([key]) => !strip.has(key))) } : {}),
+        ...(Array.isArray(schema.required) ? { required: schema.required.filter((key) => !strip.has(key)) } : {}),
+      },
+    };
+  }
+  const own = typeof active.description === "string" ? active.description : "";
   // The agent prompt calls the tool by OpenCode's name ("task(...)"); a wire
   // name that differs by more than case needs saying once.
   const renamed = active.name.toLowerCase() !== claudeTool.name.toLowerCase();
   return {
+    ...active,
     name: claudeTool.name,
-    description: own === undefined
-      ? claudeTool.description
-      : renamed
+    description: renamed
       ? `Your instructions call this tool \`${active.name}\`: ${active.name}(...) means a call to this tool.\n\n${own}`
       : own,
-    input_schema: active.input_schema ?? claudeTool.input_schema,
+    input_schema: active.input_schema,
   };
 }
 

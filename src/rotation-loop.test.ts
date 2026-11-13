@@ -285,6 +285,21 @@ describe("pool rotation: in-place retries share one wait budget per request", ()
     assert.ok((accountState("alice")?.cooldownUntil ?? 0) > Date.now());
   });
 
+  it("traces the pool's retries and rotation, and counts every send", async () => {
+    const trace = path.join(home, "trace.jsonl");
+    process.env.ANTHROPIC_TRACE_PATH = trace;
+    try {
+      const { result } = await recordingWaits(() => sendWith({ alice: limited("4"), bob: OK }));
+      const [line] = fs.readFileSync(trace, "utf8").trim().split("\n").map((text) => JSON.parse(text));
+      assert.deepEqual(line.events.map((e: { kind: string }) => e.kind), ["retry", "retry", "rotate"]);
+      assert.deepEqual(line.events[2], { kind: "rotate", from: "alice", to: "bob", status: 429, action: "ROTATE_COOLDOWN" });
+      assert.equal(line.sends, result.tried.length);
+      assert.deepEqual(line.account, { kind: "pool", label: "bob" });
+    } finally {
+      delete process.env.ANTHROPIC_TRACE_PATH;
+    }
+  });
+
   it("cools every account instead of sleeping when each asks to retry in 60s", async () => {
     const { result, waits } = await recordingWaits(() =>
       sendWith({ alice: limited("60"), bob: limited("60") }));

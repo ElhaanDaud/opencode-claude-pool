@@ -224,7 +224,7 @@ describe("OpenCode 2: request rewrite (prepareRequest)", () => {
     assert.deepEqual(sent[1]!.body.thinking, { type: "adaptive" });
   });
 
-  it("sends quoted text verbatim and renames only a standalone OpenCode", async () => {
+  it("sends quoted text verbatim and the host's system text as written", async () => {
     await enroll(["alice"]);
     const sent = stubFetch(() => OK);
     const hooks = await load();
@@ -235,7 +235,7 @@ describe("OpenCode 2: request rewrite (prepareRequest)", () => {
       messages: [{ role: "user", content: [{ type: "text", text: '"hello"' }] }],
     }), 200);
     const system = (sent[0]!.body.system as Array<{ text: string }>).map((block) => block.text).join("\n");
-    assert.match(system, /You are Claude Code\. Config: \/Applications\/OpenCode\.app, ~\/\.config\/opencode/);
+    assert.match(system, /You are OpenCode\. Config: \/Applications\/OpenCode\.app, ~\/\.config\/opencode/);
     const messages = sent[0]!.body.messages as Array<{ content: Array<{ text: string }> }>;
     assert.equal(messages[0]!.content[0]!.text, '"hello"');
   });
