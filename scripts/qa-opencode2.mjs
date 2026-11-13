@@ -196,6 +196,8 @@ async function makeEnv({ script = [textStep()], plugin = true, creds = true } = 
     ANTHROPIC_TOKEN_URL: `${fake.url}/v1/oauth/token`,
     ANTHROPIC_PROFILE_URL: `${fake.url}/api/oauth/profile`,
     ANTHROPIC_USAGE_URL: `${fake.url}/api/oauth/usage`,
+    // The fake API stands in for Anthropic's, which alone gets the login by default.
+    ANTHROPIC_TRUSTED_ORIGINS: fake.url,
     ANTHROPIC_CLI_VERSION: "2.1.0", // else the plugin shells out to `claude --version`
   };
   if (opts.placeholder) env.ANTHROPIC_API_KEY = "oauth-placeholder";

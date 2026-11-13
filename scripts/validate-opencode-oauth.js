@@ -1,4 +1,19 @@
 #!/usr/bin/env node
+/**
+ * LIVE MAINTENANCE TOOL. It reads your real Claude Code and OpenCode logins,
+ * sends real inference requests through both (using your subscription), queries
+ * the usage endpoint, and captures Claude Code's system prompt into the
+ * bridge's prompt cache. It runs only with --live. Credential-free checks:
+ * scripts/qa-opencode1.mjs and scripts/qa-opencode2.mjs.
+ */
+
+if (!process.argv.includes("--live")) {
+  console.error(
+    "validate-opencode-oauth.js is a live tool: it uses your real logins, sends real requests and " +
+      "captures Claude Code's system prompt. Re-run with --live to proceed (npm run validate:oauth -- --live ...).",
+  );
+  process.exit(2);
+}
 
 import http from "node:http";
 import https from "node:https";
@@ -7,7 +22,7 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { spawn } from "node:child_process";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -271,9 +286,14 @@ async function captureOpenCode({ model, prompt, outDir, replaySession }) {
   const configRoot = mkdtempSync(join(tmpdir(), "opencode-bridge-"));
   const configDir = join(configRoot, "opencode");
   mkdirSync(configDir, { recursive: true });
+  // OpenCode 1 loads a plugin through a module that re-exports only the
+  // default, as the install instructions set it up; the bare dist module
+  // exports helpers the loader would also try to run as plugins.
+  const wrapperPath = join(configDir, "claude-bridge-wrapper.mjs");
+  writeFileSync(wrapperPath, `export { default } from ${JSON.stringify(pathToFileURL(distPluginPath).href)};\n`);
   writeFileSync(join(configDir, "opencode.json"), JSON.stringify({
     $schema: "https://opencode.ai/config.json",
-    plugin: [distPluginPath],
+    plugin: [pathToFileURL(wrapperPath).href],
   }, null, 2));
 
   const proxy = await startCaptureProxy("opencode", outDir);
@@ -289,6 +309,8 @@ async function captureOpenCode({ model, prompt, outDir, replaySession }) {
       env: {
         XDG_CONFIG_HOME: configRoot,
         ANTHROPIC_BASE_URL: `http://127.0.0.1:${proxy.port}`,
+        // The capture proxy forwards to Anthropic; the bridge sends the login only to trusted origins.
+        ANTHROPIC_TRUSTED_ORIGINS: `http://127.0.0.1:${proxy.port}`,
         ...(replaySession?.sessionID ? { ANTHROPIC_SESSION_ID: replaySession.sessionID } : {}),
         ...(replaySession?.billingCch ? { ANTHROPIC_BILLING_CCH: replaySession.billingCch } : {}),
       },
@@ -478,9 +500,17 @@ function writePromptCache(captures) {
     mkdirSync(dirname(promptCachePath), { recursive: true });
     // Write then rename, so the bridge never reads a half-written file.
     tempPath = `${promptCachePath}.${process.pid}.tmp`;
+    const capturedAt = new Date().toISOString();
     writeFileSync(tempPath, JSON.stringify({
       source: "claude-code-capture",
-      updated_at: new Date().toISOString(),
+      updated_at: capturedAt,
+      // Read by the bridge: a capture from another Claude Code version is
+      // flagged, and the session-specific sections are never sent.
+      provenance: {
+        cliVersion: billingMatch ? billingMatch[1].split(".").slice(0, 3).join(".") : null,
+        capturedAt,
+        workingDirectory: process.cwd(),
+      },
       billing: billingMatch ? {
         ccVersion: billingMatch[1],
         ccVersionSuffix: billingMatch[1].split(".").at(-1),

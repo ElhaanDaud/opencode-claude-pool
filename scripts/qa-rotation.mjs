@@ -1,4 +1,10 @@
 /**
+ * LIVE MAINTENANCE TOOL — not offline QA. It uses your real enrolled pool
+ * accounts (Keychain on macOS), may refresh their single-use tokens against
+ * Anthropic's token endpoint, and scenario S1 sends a real inference request.
+ * It runs only with --live. For credential-free checks use
+ * scripts/qa-opencode1.mjs or scripts/qa-opencode2.mjs.
+ *
  * End-to-end QA harness for multi-account rotation.
  *
  * Drives the REAL plugin factory and its real auth.loader fetch wrapper.
@@ -6,6 +12,15 @@
  * controlled 429/403 responses, because deliberately exhausting a live Max
  * subscription to observe a real 429 is not a reasonable test cost.
  */
+
+if (!process.argv.includes("--live")) {
+  console.error(
+    "qa-rotation.mjs is a live tool: it uses your real pool accounts, may refresh their tokens, " +
+      "and sends a real request to Anthropic. Re-run with --live to proceed. " +
+      "Credential-free checks: node scripts/qa-opencode1.mjs",
+  );
+  process.exit(2);
+}
 
 import http from "node:http";
 import { createHash } from "node:crypto";
@@ -91,8 +106,11 @@ function startMockUpstream(script) {
   });
   return new Promise((resolve) => {
     server.listen(0, "127.0.0.1", () => {
+      // The fake upstream stands in for Anthropic's API, which alone gets the login by default.
+      const origin = `http://127.0.0.1:${server.address().port}`;
+      process.env.ANTHROPIC_TRUSTED_ORIGINS = [process.env.ANTHROPIC_TRUSTED_ORIGINS, origin].filter(Boolean).join(",");
       resolve({
-        url: `http://127.0.0.1:${server.address().port}/v1/messages`,
+        url: `${origin}/v1/messages`,
         seen,
         calls: () => i,
         close: () => new Promise((r) => server.close(r)),

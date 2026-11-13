@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
+# LIVE MAINTENANCE TOOL: runs the real Claude CLI with your login, sends a real
+# request (uses your subscription) and saves Claude Code's prompt and request
+# body to /tmp. Runs only with --live as the first argument.
+#
 # Intercept Claude Code network calls to see exactly what headers/body it sends.
-# Usage: ./scripts/intercept-claude.sh [model]
+# Usage: ./scripts/intercept-claude.sh --live [model]
 #
 # Starts a local proxy, runs Claude CLI through it, and saves the full request
 # to a private /tmp/claude-intercept.XXXXXX/N-{headers,body}.json for analysis.
@@ -8,6 +12,11 @@
 
 set -euo pipefail
 
+if [[ "${1:-}" != "--live" ]]; then
+  echo "intercept-claude.sh is a live tool: it runs the real Claude CLI with your login, sends a real request and saves its prompt. Re-run with --live first." >&2
+  exit 2
+fi
+shift
 MODEL="${1:-claude-sonnet-4-6}"
 
 umask 077
