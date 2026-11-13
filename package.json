@@ -1,7 +1,7 @@
 {
   "name": "opencode-claude-bridge",
   "version": "1.10.12",
-  "description": "OpenCode \u2194 Claude bridge \u2014 keychain sync + PKCE OAuth + request transformation",
+  "description": "OpenCode ↔ Claude bridge with a multi-account pool. Source-installed fork of dotCipher/opencode-claude-bridge; the npm package of that name is upstream.",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -21,14 +21,21 @@
     "./package.json": "./package.json"
   },
   "files": [
-    "dist"
+    "dist",
+    "NOTICE.md"
   ],
   "scripts": {
-    "build": "tsc",
+    "build": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\" && tsc -p tsconfig.build.json && node scripts/build-info.mjs",
     "prepublishOnly": "npm run build",
     "typecheck": "tsc --noEmit",
-    "test": "npm run build && node --test $(find dist -name '*.test.js' | sort)",
+    "test": "node -e \"require('node:fs').rmSync('build/test', { recursive: true, force: true })\" && tsc --outDir build/test && node scripts/run-tests.mjs",
+    "test:native": "node -e \"require('node:fs').rmSync('build/test', { recursive: true, force: true })\" && tsc --outDir build/test && node scripts/run-tests.mjs --native",
+    "verify:build": "node scripts/verify-build.mjs",
+    "check:package": "node scripts/check-package.mjs",
     "validate:oauth": "npm run build && node scripts/validate-opencode-oauth.js"
+  },
+  "engines": {
+    "node": ">=20"
   },
   "keywords": [
     "opencode",
@@ -38,7 +45,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/dotCipher/opencode-claude-bridge"
+    "url": "https://github.com/ElhaanDaud/opencode-claude-pool"
   },
   "author": "dotCipher",
   "license": "MIT",
@@ -47,6 +54,6 @@
     "typescript": "^5.9.3"
   },
   "bin": {
-    "claude-pool": "./scripts/claude-pool.mjs"
+    "claude-pool": "./dist/claude-pool.mjs"
   }
 }
