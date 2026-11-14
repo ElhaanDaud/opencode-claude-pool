@@ -3,6 +3,8 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import { notify } from "./notices.js";
+
 const CLAUDE_BINARIES = [
   "claude",
   join(homedir(), ".local", "bin", "claude"),
@@ -33,8 +35,10 @@ function detectClaudeVersion(): string {
       return parsed.version;
     }
   } catch {}
-  console.error(
-    `[opencode-claude-bridge] Claude Code CLI not found; advertising version ${FALLBACK_CLI_VERSION}, which newer models reject. Set ANTHROPIC_CLI_VERSION to override.`,
+  notify(
+    "warning",
+    `Claude Code isn't installed (or didn't answer), so requests claim version ${FALLBACK_CLI_VERSION}, which newer models reject. Install Claude Code, or set ANTHROPIC_CLI_VERSION.`,
+    { detail: `[opencode-claude-bridge] Claude Code CLI not found; advertising version ${FALLBACK_CLI_VERSION}, which newer models reject. Set ANTHROPIC_CLI_VERSION to override.` },
   );
   return FALLBACK_CLI_VERSION;
 }

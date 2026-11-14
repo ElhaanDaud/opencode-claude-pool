@@ -40,6 +40,7 @@ import { randomUUID } from "node:crypto";
 import { classify } from "./classifier.js";
 import { selectNext } from "./selection.js";
 import { LockTimeoutError } from "./rotation-state.js";
+import { log, notify, once } from "../notices.js";
 import type { RotationStateStore } from "./rotation-state.js";
 import type { createAccountStore } from "./secret-store.js";
 import type {
@@ -236,14 +237,16 @@ export function createRotationManager(opts: ManagerOptions) {
     const aside = `${journalPath}.${randomUUID()}.stale`;
     try {
       fs.renameSync(journalPath, aside);
-      console.error(`[claude-pool] set aside refresh journal for "${label}" (${reason}): ${aside}`);
+      log("warn", `[claude-pool] set aside refresh journal for "${label}" (${reason}): ${aside}`);
     } catch (err) {
-      console.error(
-        `[claude-pool] failed to set aside refresh journal for "${label}": ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-      );
-      throw new JournalQuarantineError(err instanceof Error ? err.message : String(err));
+      const reason = err instanceof Error ? err.message : String(err);
+      const detail = `[claude-pool] failed to set aside refresh journal for "${label}": ${reason}`;
+      if (once(`journal-stuck:${label}`)) {
+        notify("error", `Pool account "${label}" isn't being refreshed: its refresh journal can't be moved aside (${reason}). See ${path.dirname(journalPath)}.`, { detail });
+      } else {
+        log("error", detail);
+      }
+      throw new JournalQuarantineError(reason);
     }
   }
 
@@ -277,7 +280,7 @@ export function createRotationManager(opts: ManagerOptions) {
     }
     await accounts.updateTokens(entry.label, entry.tokens);
     clearJournal();
-    console.error(
+    log("info",
       `[claude-pool] replayed pending refresh for "${entry.label}" from journal`,
     );
     return entry;
@@ -289,7 +292,7 @@ export function createRotationManager(opts: ManagerOptions) {
     try {
       return (await state.withLock(commitPendingJournalLocked)) !== null;
     } catch (err) {
-      console.error(
+      log("warn",
         `[claude-pool] failed to replay refresh journal: ${
           err instanceof Error ? err.message : String(err)
         }`,
@@ -357,7 +360,7 @@ export function createRotationManager(opts: ManagerOptions) {
           writeJournal({ label, tokens: fresh, writtenAt: clock(), replaces: current.oauth.refresh });
         } catch (err) {
           // Commit anyway: skipping the store write would drop the only valid tokens.
-          console.error(
+          log("warn",
             `[claude-pool] failed to journal refresh for "${label}": ${
               err instanceof Error ? err.message : String(err)
             }`,
@@ -409,7 +412,7 @@ export function createRotationManager(opts: ManagerOptions) {
       for (const secret of [record.oauth.access, record.oauth.refresh]) {
         if (secret) detail = detail.replaceAll(secret, "[redacted]");
       }
-      console.error(`[claude-pool] could not mirror "${record.label}" into auth.json: ${detail}`);
+      log("warn", `[claude-pool] could not mirror "${record.label}" into auth.json: ${detail}`);
     }
   }
 

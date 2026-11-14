@@ -7,6 +7,8 @@
 
 import fs from "node:fs";
 
+import { log, notify, once } from "./notices.js";
+
 export type ChangeReason =
   /** The caller set nothing, so the bridge's default applies. */
   | "default"
@@ -105,18 +107,21 @@ export function limitCacheBreakpoints(parsed: {
 
 /**
  * Sections of a captured Claude Code prompt that describe the session it was
- * captured in rather than Claude Code itself: its memory directory is a path
- * under the captured project, and its session guidance lists that session's
- * skills and commands. Sent elsewhere, they give the model wrong instructions.
+ * captured in rather than Claude Code itself: its memory section ("auto
+ * memory" in current versions, "Memory" before) points at a directory under
+ * the captured project, and its session guidance lists that session's skills
+ * and commands. Sent elsewhere, they give the model wrong instructions.
  */
-const NON_PORTABLE_SECTIONS = new Set(["Memory", "Session-specific guidance"]);
+function isNonPortable(heading: string): boolean {
+  return /\bmemor(y|ies)\b/i.test(heading) || heading.toLowerCase() === "session-specific guidance";
+}
 
 /** `skipping`: whether the text starts inside a section left out, as a block after its heading does. */
 function filterSections(text: string, skipping: boolean): { text: string; skipping: boolean } {
   const kept: string[] = [];
   for (const line of text.split("\n")) {
     const heading = /^# (.+?)\s*$/.exec(line);
-    if (heading) skipping = NON_PORTABLE_SECTIONS.has(heading[1]!);
+    if (heading) skipping = isNonPortable(heading[1]!);
     if (!skipping) kept.push(line);
   }
   return { text: kept.join("\n").replace(/\n{3,}/g, "\n\n"), skipping };
@@ -204,7 +209,10 @@ export function appendTrace(record: Record<string, unknown>): void {
     // Tracing must never fail a request, nor flood the log while it can't write.
     if (traceFailed) return;
     traceFailed = true;
-    console.error(`[opencode-claude-bridge] could not write the request trace to ${file}: ${err instanceof Error ? err.message : String(err)}`);
+    const reason = err instanceof Error ? err.message : String(err);
+    notify("warning", `The request trace can't be written to ${file} (${reason}); requests carry on. Check ANTHROPIC_TRACE_PATH.`, {
+      detail: `[opencode-claude-bridge] could not write the request trace to ${file}: ${reason}`,
+    });
   }
 }
 
@@ -224,7 +232,11 @@ export function trustedOrigins(): Set<string> {
     try {
       origins.add(new URL(entry).origin);
     } catch {
-      console.error(`[opencode-claude-bridge] ignoring ANTHROPIC_TRUSTED_ORIGINS entry that isn't a URL: ${entry}`);
+      if (once(`trusted-origin:${entry}`)) {
+        notify("warning", `ANTHROPIC_TRUSTED_ORIGINS entry "${entry}" isn't a URL, so it's ignored.`, {
+          detail: `[opencode-claude-bridge] ignoring ANTHROPIC_TRUSTED_ORIGINS entry that isn't a URL: ${entry}`,
+        });
+      }
     }
   }
   return origins;
@@ -245,7 +257,7 @@ export function untrustedDestinationResponse(url: string): Response {
     `opencode-claude-bridge did not send this request: ${origin} is not an Anthropic origin, and your Claude ` +
     `subscription login is only sent to one. If it is a proxy you trust, add it to ANTHROPIC_TRUSTED_ORIGINS ` +
     `(e.g. ANTHROPIC_TRUSTED_ORIGINS=${origin}) and restart OpenCode.`;
-  console.error(`[opencode-claude-bridge] ${message}`);
+  log("warn", `[opencode-claude-bridge] ${message}`);
   return new Response(JSON.stringify({ type: "error", error: { type: "invalid_request_error", message } }), {
     status: 400,
     headers: { "content-type": "application/json" },

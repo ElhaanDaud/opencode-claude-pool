@@ -29,6 +29,7 @@ import {
 } from "../oauth.js";
 import type { OAuthCallbackServer, OAuthTokens } from "../oauth.js";
 import { buildPoolBusyResponse, buildPoolExhaustedResponse } from "../pool/bridge.js";
+import { log } from "../notices.js";
 import { createToaster } from "../pool/notify.js";
 import { applyClaudeToolsForV2, wrapV2Response } from "./tools.js";
 import { LockTimeoutError } from "../pool/rotation-state.js";
@@ -350,7 +351,7 @@ async function setup(ctx: V2Context): Promise<() => void> {
     try {
       server = await startOAuthCallbackServer();
     } catch (err) {
-      console.error(`[opencode-claude-bridge] could not start the OAuth callback server: ${err}`);
+      log("warn", `[opencode-claude-bridge] could not start the OAuth callback server: ${err}`);
     }
     if (!server) return authorizeByPaste();
 
@@ -426,13 +427,13 @@ async function setup(ctx: V2Context): Promise<() => void> {
         acquired = await pool.acquire();
       } catch (err) {
         if (!(err instanceof LockTimeoutError)) throw err;
-        console.error(`[claude-pool] ${err.message}`);
+        log("warn", `[claude-pool] ${err.message}`);
         await stashResponse(event, buildPoolBusyResponse());
         return;
       }
       if (acquired.kind === "exhausted") {
         const message = pool.describeExhaustion(acquired.info);
-        console.error(`[claude-pool] ${message}`);
+        log("warn", `[claude-pool] ${message}`);
         await stashResponse(
           event,
           await markExhausted(buildPoolExhaustedResponse(message, acquired.info.earliestReset, Date.now())),
@@ -451,7 +452,7 @@ async function setup(ctx: V2Context): Promise<() => void> {
       if (!tokens || tokens.expires < Date.now() + EXPIRY_BUFFER_MS) {
         if (!warnedNoCredential) {
           warnedNoCredential = true;
-          console.error(`[opencode-claude-bridge] ${NO_CREDENTIAL}`);
+          log("warn", `[opencode-claude-bridge] ${NO_CREDENTIAL}`);
         }
         // Sent as it is, a stale CLI login or the imported OpenCode 1 bearer
         // only earns a 401 that names no cause.
@@ -560,7 +561,7 @@ async function setup(ctx: V2Context): Promise<() => void> {
       });
     } catch (err) {
       if (!failed) throw err;
-      console.error(
+      log("warn",
         `[claude-pool] resending failed (${err instanceof Error ? err.message : String(err)}); passing the HTTP ${failed.status} through`,
       );
       settled = failed;

@@ -310,7 +310,8 @@ describe("single-account coordinator", () => {
 
     await account.recordLogin(cli, "claude-cli");
     assert.equal(store.auth?.refresh, "cli-fail-claude-r");
-    assert.equal(account.ownerOf("cli-fail-r+"), "claude-cli");
+    assert.equal(account.ownerOf(store.auth?.refresh), "claude-cli");
+    assert.equal(fs.existsSync(path.join(dir, "single-account-owner.json")), false);
   });
 
   it("keeps the stored login OpenCode's own across sign-ins whose save fails", async (t) => {
@@ -334,6 +335,185 @@ describe("single-account coordinator", () => {
     }
     assert.equal(store.auth?.refresh, "kept-r");
     assert.equal(account.ownerOf("kept-r"), "bridge");
+  });
+
+  function refreshBlockingOwnerRecord(dir: string, refresh: (token: string) => Promise<OAuthTokens>) {
+    const owners = path.join(dir, "single-account-owner.json");
+    return async (token: string) => {
+      if (!fs.statSync(owners, { throwIfNoEntry: false })?.isDirectory()) {
+        fs.rmSync(owners, { force: true });
+        fs.mkdirSync(owners);
+      }
+      return refresh(token);
+    };
+  }
+
+  it("keeps a refreshed login OpenCode's own when its ownership record can't be written, never taking Claude Code's", async (t) => {
+    const { dir, store, own, journal } = setup(t, { type: "oauth", access: "a", refresh: "unrec-r", expires: 0 });
+    own("unrec-r");
+    const endpoint = tokenEndpoint("unrec-r");
+    const account = createSingleAccount({
+      getAuth: async () => store.auth,
+      save: async (tokens) => { store.auth = { type: "oauth", ...tokens }; },
+      readCli: () => ({ access: "unrec-claude", refresh: "unrec-claude-r", expires: Date.now() + HOUR }),
+      refresh: refreshBlockingOwnerRecord(dir, endpoint.refresh),
+      withLock: direct,
+      dir,
+    });
+    assert.equal((await account.tokens(store.auth)).refresh, "unrec-r+");
+    assert.equal(account.ownerOf("unrec-r+"), "bridge");
+    assert.equal(JSON.parse(fs.readFileSync(journal, "utf8")).tokens.refresh, "unrec-r+");
+
+    store.auth = { ...store.auth!, expires: 0 };
+    assert.equal((await account.tokens(store.auth)).refresh, "unrec-r++");
+    assert.equal(store.auth?.refresh, "unrec-r++");
+    assert.deepEqual(endpoint.exchanges, ["unrec-r", "unrec-r+"]);
+  });
+
+  it("keeps it OpenCode's own across a restart through the journal, and records it once the record can be written", async (t) => {
+    const { dir, store, own, journal } = setup(t, { type: "oauth", access: "a", refresh: "unrec2-r", expires: 0 });
+    own("unrec2-r");
+    const endpoint = tokenEndpoint("unrec2-r");
+    const options = {
+      getAuth: async () => store.auth,
+      save: async (tokens: OAuthTokens) => { store.auth = { type: "oauth", ...tokens }; },
+      readCli: () => ({ access: "unrec2-claude", refresh: "unrec2-claude-r", expires: Date.now() + HOUR }),
+      withLock: direct,
+      dir,
+    };
+    await createSingleAccount({ ...options, refresh: refreshBlockingOwnerRecord(dir, endpoint.refresh) }).tokens(store.auth);
+    fs.rmSync(path.join(dir, "single-account-owner.json"), { recursive: true });
+
+    // A restart: nothing in memory, so only the journal says whose login this is.
+    const restarted = await import(new URL("./single-account.js?restart-unrecorded", import.meta.url).href) as typeof import("./single-account.js");
+    const account = restarted.createSingleAccount({ ...options, refresh: endpoint.refresh });
+    assert.equal(account.ownerOf("unrec2-r+"), "bridge");
+    assert.equal(await account.seedFromCli(store.auth), false);
+    assert.equal(store.auth?.refresh, "unrec2-r+");
+
+    store.auth = { ...store.auth!, expires: 0 };
+    assert.equal((await account.tokens(store.auth)).refresh, "unrec2-r++");
+    assert.equal(store.auth?.refresh, "unrec2-r++");
+    assert.equal(account.ownerOf("unrec2-r++"), "bridge");
+    assert.equal(fs.existsSync(journal), false);
+    assert.deepEqual(endpoint.exchanges, ["unrec2-r", "unrec2-r+"]);
+  });
+
+  for (const [reason, damage] of [
+    ["not valid JSON", (file: string) => fs.writeFileSync(file, "SECRET-journal-token {")],
+    ["not a refresh journal", (file: string) => fs.writeFileSync(file, JSON.stringify({ tokens: {} }))],
+    ["EISDIR", (file: string) => { fs.rmSync(file); fs.mkdirSync(file); }],
+  ] as const) {
+    it(`never refreshes OpenCode's own login while its journal can't be read (${reason}), and replays it once repaired`, async (t) => {
+      const token = `unreadable-${reason.replace(/\W+/g, "-")}`;
+      const { dir, store, own, journal } = setup(t, { type: "oauth", access: "a", refresh: token, expires: 0 });
+      own(token);
+      const endpoint = tokenEndpoint(token);
+      let storageUp = false;
+      const options = {
+        getAuth: async () => store.auth,
+        save: async (tokens: OAuthTokens) => {
+          if (!storageUp) throw new Error("storage unavailable");
+          store.auth = { type: "oauth", ...tokens };
+        },
+        readCli: () => null,
+        refresh: endpoint.refresh,
+        withLock: direct,
+        dir,
+      };
+      await createSingleAccount(options).tokens(store.auth);
+      const written = fs.readFileSync(journal, "utf8");
+      damage(journal);
+
+      const restarted = await import(new URL(`./single-account.js?restart-${token}`, import.meta.url).href) as typeof import("./single-account.js");
+      const account = restarted.createSingleAccount(options);
+      await assert.rejects(account.tokens(store.auth), (err: unknown) =>
+        err instanceof restarted.CredentialUnavailableError && err.message.includes(`(${reason})`) && !err.message.includes("SECRET"));
+      assert.deepEqual(endpoint.exchanges, [token]);
+      assert.equal(store.auth?.refresh, token);
+
+      fs.rmSync(journal, { recursive: true, force: true });
+      fs.writeFileSync(journal, written);
+      storageUp = true;
+      assert.equal((await account.tokens(store.auth)).refresh, `${token}+`);
+      assert.equal(store.auth?.refresh, `${token}+`);
+      assert.deepEqual(endpoint.exchanges, [token]);
+    });
+  }
+
+  it("never resends a spent refresh token however many refreshes go unsaved", async (t) => {
+    t.mock.method(console, "error", () => {});
+    const { dir, store, own } = setup(t, { type: "oauth", access: "long0/access", refresh: "long0", expires: 0 });
+    own("long0");
+    const endpoint = tokenEndpoint("long0");
+    let storageUp = false;
+    const account = createSingleAccount({
+      getAuth: async () => store.auth,
+      save: async (tokens) => {
+        if (!storageUp) throw new Error("storage unavailable");
+        store.auth = { type: "oauth", ...tokens };
+      },
+      readCli: () => null,
+      refresh: endpoint.refresh,
+      withLock: direct,
+      dir,
+    });
+    let latest = await account.tokens(store.auth);
+    // Past the first refresh, neither the journal nor the record can be updated.
+    fs.chmodSync(dir, 0o500);
+    try {
+      for (let i = 1; i < 70; i++) latest = await account.tokens(store.auth, { rejected: latest.access });
+    } finally {
+      fs.chmodSync(dir, 0o700);
+    }
+    assert.equal(new Set(endpoint.exchanges).size, 70);
+    storageUp = true;
+    assert.equal((await account.tokens(store.auth)).refresh, latest.refresh);
+    assert.equal(store.auth?.refresh, latest.refresh);
+    assert.equal(endpoint.exchanges.length, 70);
+  });
+
+  it("sends nothing from a chain that loops back to a token it already spent", async (t) => {
+    t.mock.method(console, "error", () => {});
+    const { dir, store, own } = setup(t, { type: "oauth", access: "loop-a/access", refresh: "loop-a", expires: 0 });
+    own("loop-a");
+    const issued = [{ access: "loop-b/access", refresh: "loop-b" }, { access: "loop-a2/access", refresh: "loop-a" }];
+    const exchanges: string[] = [];
+    const account = createSingleAccount({
+      getAuth: async () => store.auth,
+      save: async () => { throw new Error("storage unavailable"); },
+      readCli: () => null,
+      refresh: async (token) => {
+        exchanges.push(token);
+        const next = issued.shift();
+        if (!next) throw new Error("refreshed a token from a looping chain");
+        return { ...next, expires: Date.now() + HOUR };
+      },
+      withLock: direct,
+      dir,
+    });
+    let latest = await account.tokens(store.auth);
+    latest = await account.tokens(store.auth, { rejected: latest.access });
+    await assert.rejects(account.tokens(store.auth, { rejected: latest.access }), CredentialUnavailableError);
+    assert.deepEqual(exchanges, ["loop-a", "loop-b"]);
+  });
+
+  it("keeps working with an endpoint that doesn't rotate refresh tokens", async (t) => {
+    const { dir, store, own } = setup(t, { type: "oauth", access: "same/access-0", refresh: "same-r", expires: 0 });
+    own("same-r");
+    let issued = 0;
+    const account = createSingleAccount({
+      getAuth: async () => store.auth,
+      save: async (tokens) => { store.auth = { type: "oauth", ...tokens }; },
+      readCli: () => null,
+      refresh: async (token) => ({ access: `same/access-${++issued}`, refresh: token, expires: Date.now() + HOUR }),
+      withLock: direct,
+      dir,
+    });
+    const first = await account.tokens(store.auth);
+    assert.equal((await account.tokens(store.auth)).access, first.access);
+    assert.equal((await account.tokens(store.auth, { rejected: first.access })).access, "same/access-2");
+    assert.equal(store.auth?.access, "same/access-2");
   });
 
   /** Two real processes refresh one expired login at the same moment. */

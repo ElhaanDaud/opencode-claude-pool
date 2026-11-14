@@ -10,6 +10,16 @@ import {
   type PoolOAuthTokens,
   type SecretBackend,
 } from "./types.js";
+import { log, notify, once } from "../notices.js";
+
+/** Every listing reads the same broken record again: one pop-up per account, the rest in the log. */
+function reportUnreadableAccount(label: string, detail: string): void {
+  if (once(`unreadable-account:${label}`)) {
+    notify("warning", `Pool account "${label}" can't be read, so it's left out of rotation. Remove it with claude-pool remove ${label}, then enroll it again.`, { detail });
+  } else {
+    log("warn", detail);
+  }
+}
 
 const execFileAsync = promisify(execFile);
 const SECURITY_TIMEOUT_MS = 10_000;
@@ -340,7 +350,7 @@ export function createAccountStore(backend: SecretBackend) {
       // Report only the lookup key: JSON parse errors can include secret input.
     }
 
-    console.error(`Failed to parse account record "${label}"`);
+    reportUnreadableAccount(label, `Failed to parse account record "${label}"`);
     return null;
   }
 
@@ -376,7 +386,7 @@ export function createAccountStore(backend: SecretBackend) {
           const account = await getAccount(label);
           if (account !== null) accounts.push(account);
         } catch (error) {
-          console.error(`[claude-pool] skipping "${label}": ${error instanceof Error ? error.message : String(error)}`);
+          reportUnreadableAccount(label, `[claude-pool] skipping "${label}": ${error instanceof Error ? error.message : String(error)}`);
         }
       }
       return accounts;

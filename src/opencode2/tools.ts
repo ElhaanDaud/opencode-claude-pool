@@ -15,6 +15,7 @@ import {
   getClaudeTools,
 } from "../claude-tools.js";
 import type { ToolDefinition } from "../claude-tools.js";
+import { log } from "../notices.js";
 import { limitCacheBreakpoints } from "../request-policy.js";
 import { translateJsonResponse, translateSseStream } from "../stream.js";
 
@@ -363,7 +364,7 @@ export async function wrapV2Response(response: Response, inboundToolNameMap: Rec
   const deps = {
     inboundToolNameMap,
     translateToolArgs,
-    debug: (msg: string) => console.error(`[opencode-claude-bridge] stream: ${msg}`),
+    debug: (msg: string) => log("debug", `[opencode-claude-bridge] stream: ${msg}`),
   };
   if (contentType === "application/json") return translateJsonResponse(response, deps);
   if (contentType !== "text/event-stream") return response;

@@ -54,6 +54,8 @@ import { LockTimeoutError, createRotationStateStore, defaultLockPath, defaultSta
 import { truncate } from "./pool/dashboard.js";
 import { autoEnrollIfNew, labelSharingClaudeCliLogin, sharedLoginWarning } from "./pool/enroll.js";
 import { createToaster } from "./pool/notify.js";
+import { log, markSessionActive, notify, once, startNotices, whenSessionActive } from "./notices.js";
+import type { LogClient } from "./notices.js";
 import type { Toaster } from "./pool/notify.js";
 import type { PoolClient } from "./pool/bridge.js";
 import { createAccountStore, createSecretBackend } from "./pool/secret-store.js";
@@ -221,7 +223,7 @@ const ANTHROPIC_MODELS: Record<string, ProviderModel> = {
   },
 };
 
-type PluginClient = {
+type PluginClient = LogClient & {
   auth: {
     /** OpenCode's SDK resolves a failed write as `{ error }` rather than throwing it. */
     set: (args: {
@@ -420,9 +422,9 @@ export function getClaudeToolsForActiveOpenCodeTools(
 
     const inputSchema = getToolInputSchema(tool);
     if (!inputSchema) {
-      console.error(
-        `[opencode-claude-bridge] Dropping active tool "${name}" — missing or invalid input_schema`,
-      );
+      const detail = `[opencode-claude-bridge] Dropping active tool "${name}" — missing or invalid input_schema`;
+      if (once(`tool-schema:${name}`)) notify("warning", `OpenCode's tool "${name}" has no valid input schema, so the model isn't offered it.`, { detail });
+      else log("warn", detail);
       continue;
     }
 
@@ -588,10 +590,10 @@ function buildCredentialBusyResponse(message: string): Response {
 function credentialFailureResponse(err: unknown): Response {
   const detail = err instanceof Error ? err.message : String(err);
   if (err instanceof CredentialBusyError) {
-    console.error(`[opencode-claude-bridge] ${detail}`);
+    log("warn", `[opencode-claude-bridge] ${detail}`);
     return buildCredentialBusyResponse(detail);
   }
-  console.error(`[opencode-claude-bridge] OAuth credential unavailable: ${detail}`);
+  log("error", `[opencode-claude-bridge] OAuth credential unavailable: ${detail}`);
   return buildAuthFailureResponse(detail);
 }
 
@@ -676,7 +678,7 @@ async function recordPoolState(what: string, action: () => Promise<void>): Promi
   try {
     await action();
   } catch (err) {
-    console.error(`[claude-pool] could not record ${what}; continuing: ${err instanceof Error ? err.message : String(err)}`);
+    log("warn", `[claude-pool] could not record ${what}; continuing: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 
@@ -897,25 +899,23 @@ export function traceRequest(input: {
   });
 }
 
-const warned = new Set<string>();
-
-/** Once per process: a per-request warning would bury everything else in the log. */
-function warnOnce(key: string, message: string): void {
-  if (warned.has(key)) return;
-  warned.add(key);
-  console.error(message);
-}
-
 /** A capture taken with another Claude Code version is still used, but never silently. */
 function warnIfCaptureStale(cache: ClaudeSystemPromptCache): void {
   const { cliVersion, capturedAt } = captureProvenance(cache);
   const installed = getCliVersion();
-  if (cliVersion === installed) return;
-  warnOnce(
-    `capture:${cliVersion}:${installed}`,
-    `[opencode-claude-bridge] the captured Claude Code prompt at ${SYSTEM_PROMPT_CACHE_PATH} is from Claude Code ${cliVersion ?? "an unknown version"}` +
-      `${capturedAt ? ` (captured ${capturedAt})` : ""}, but ${installed} is installed; only its portable sections are sent. ` +
-      "To capture it again, run `npm run validate:oauth -- --live` (it sends real requests with your logins).",
+  // Once per process: a per-request warning would bury everything else in the log.
+  if (cliVersion === installed || !once(`capture:${cliVersion}:${installed}`)) return;
+  notify(
+    "warning",
+    `Claude Code ${installed} is installed, but the bridge's copy of its prompt is from ${cliVersion ?? "an unknown version"}. ` +
+      "To refresh it, run in the bridge's folder: node scripts/validate-opencode-oauth.js --live --skip-opencode (one real request)",
+    {
+      detail:
+        `[opencode-claude-bridge] the captured Claude Code prompt at ${SYSTEM_PROMPT_CACHE_PATH} is from Claude Code ${cliVersion ?? "an unknown version"}` +
+        `${capturedAt ? ` (captured ${capturedAt})` : ""}, but ${installed} is installed; it is still used. ` +
+        "To capture it from the installed version, run `node scripts/validate-opencode-oauth.js --live --skip-opencode` " +
+        "in the bridge's checkout (it sends one real request with your Claude Code login).",
+    },
   );
 }
 
@@ -1090,7 +1090,7 @@ export async function prepareRequest(
       let forcesTool = parsed.tool_choice?.type === "any" || parsed.tool_choice?.type === "tool";
       if (forcesTool && !canDisableThinking(parsed.model)) {
         change("tool_choice", parsed.tool_choice, undefined, "compatibility", `${parsed.model} can't turn thinking off, which a forced tool choice needs`);
-        warnOnce(`forced-choice:${parsed.model}`, `[opencode-claude-bridge] ${parsed.model} can't turn thinking off, so a forced tool_choice is sent as auto: the model may answer without calling the tool`);
+        if (once(`forced-choice:${parsed.model}`)) log("warn", `[opencode-claude-bridge] ${parsed.model} can't turn thinking off, so a forced tool_choice is sent as auto: the model may answer without calling the tool`);
         delete parsed.tool_choice;
         forcesTool = false;
       }
@@ -1129,7 +1129,7 @@ export async function prepareRequest(
         if (repaired.messages !== parsed.messages) {
           parsed.messages = repaired.messages;
           historyRepairs = repaired.repairs;
-          console.error(`[opencode-claude-bridge] repaired the conversation so the API accepts it: ${JSON.stringify(repaired.repairs)}`);
+          log("info", `[opencode-claude-bridge] repaired the conversation so the API accepts it: ${JSON.stringify(repaired.repairs)}`);
         }
       }
       // context_management and output_config.effort are only
@@ -1252,9 +1252,11 @@ export async function prepareRequest(
       body = JSON.stringify(parsed);
     } catch (err) {
       ownsUserId = false;
-      console.error(
-        `[opencode-claude-bridge] request rewrite failed; sending the body unmodified: ${err instanceof Error ? err.message : String(err)}`,
-      );
+      const reason = err instanceof Error ? err.message : String(err);
+      notify("warning", `The bridge couldn't rewrite a request (${truncate(reason, 100)}), so it went out as OpenCode built it. Details are in OpenCode's log.`, {
+        detail: `[opencode-claude-bridge] request rewrite failed; sending the body unmodified: ${reason}`,
+        key: "rewrite-failed",
+      });
     }
   }
 
@@ -1376,7 +1378,7 @@ export async function settlePoolResponse(input: SettleInput): Promise<Response> 
 
       if (decision.action === "PASS_THROUGH") {
         if (unconfirmed.length > 0) {
-          console.error(
+          log("info",
             `[claude-pool] no other account succeeded, so ${unconfirmedLabels()} ${unconfirmed.length === 1 ? "is" : "are"} not penalised`,
           );
         }
@@ -1387,7 +1389,7 @@ export async function settlePoolResponse(input: SettleInput): Promise<Response> 
         attempt += 1;
         waitedMs += decision.backoffMs ?? 1000;
         note({ kind: "retry", layer: "pool", account: activeLabel, status: response.status, delayMs: decision.backoffMs ?? 1000 });
-        console.error(
+        log("info",
           `[claude-pool] ${activeLabel}: ${decision.reason}; retrying in ${decision.backoffMs ?? 1000}ms`,
         );
         await abortableSleep(decision.backoffMs ?? 1000, signal);
@@ -1411,13 +1413,13 @@ export async function settlePoolResponse(input: SettleInput): Promise<Response> 
           freshToken = (await untilAborted(pool.refreshLabel(activeLabel, rejectedToken), signal)).access;
         } catch (err) {
           if (signal?.aborted) throw err;
-          console.error(
+          log("warn",
             `[claude-pool] ${activeLabel}: refresh after 401 failed: ${err instanceof Error ? err.message : String(err)}`,
           );
         }
         note({ kind: "credential", reason: "rejected", account: activeLabel, outcome: freshToken && freshToken !== rejectedToken ? "new-token" : "unchanged" });
         if (freshToken && freshToken !== rejectedToken) {
-          console.error(`[claude-pool] ${activeLabel}: 401 from Anthropic; refreshed the token, retrying once`);
+          log("info", `[claude-pool] ${activeLabel}: 401 from Anthropic; refreshed the token, retrying once`);
           outHeaders["authorization"] = `Bearer ${freshToken}`;
           response = await send(outHeaders, body);
           if (response.ok) {
@@ -1430,7 +1432,7 @@ export async function settlePoolResponse(input: SettleInput): Promise<Response> 
       const signature = failureSignature(response.status, bodyText);
       const repeated = unconfirmed.find((u) => u.signature === signature);
       if (repeated) {
-        console.error(
+        log("warn",
           `[claude-pool] "${repeated.label}" and "${activeLabel}" failed identically (HTTP ${response.status}); the request is at fault, not the accounts — passing the error through without penalising either`,
         );
         return rebuild();
@@ -1438,12 +1440,12 @@ export async function settlePoolResponse(input: SettleInput): Promise<Response> 
       tried.add(activeLabel);
 
       if (response.status === 401 || response.status === 403) {
-        console.error(
+        log("info",
           `[claude-pool] ${activeLabel}: ${decision.reason}; checking another account before penalising`,
         );
         unconfirmed.push({ label: activeLabel, decision, signature });
       } else {
-        console.error(
+        log("info",
           `[claude-pool] ${activeLabel}: ${decision.reason}; rotating account`,
         );
         const penalised = activeLabel;
@@ -1458,19 +1460,19 @@ export async function settlePoolResponse(input: SettleInput): Promise<Response> 
         next = await untilAborted(pool.acquire(tried), signal);
       } catch (err) {
         if (!(err instanceof LockTimeoutError)) throw err;
-        console.error(`[claude-pool] ${err.message}; passing the current error through`);
+        log("warn", `[claude-pool] ${err.message}; passing the current error through`);
         return rebuild();
       }
       if (next.kind === "exhausted" && unconfirmed.length > 0) {
         // Unconfirmed disables need manual repair; surface the real error.
-        console.error(
+        log("warn",
           `[claude-pool] no other account available to confirm ${unconfirmedLabels()} ${unconfirmed.length === 1 ? "is" : "are"} at fault; passing the error through without penalising`,
         );
         return rebuild();
       }
       if (next.kind === "exhausted") {
         const message = pool.describeExhaustion(next.info);
-        console.error(`[claude-pool] ${message}`);
+        log("warn", `[claude-pool] ${message}`);
         toast("warning", message, `exhausted:${next.info.earliestReset}`);
         return buildPoolExhaustedResponse(
           message,
@@ -1495,7 +1497,7 @@ export async function settlePoolResponse(input: SettleInput): Promise<Response> 
         body = JSON.stringify(rebound);
       }
       attempt = 0;
-      console.error(`[claude-pool] now using account "${activeLabel}"`);
+      log("info", `[claude-pool] now using account "${activeLabel}"`);
       response = await send(outHeaders, body);
       if (response.ok) {
         await confirmPenalties();
@@ -1542,14 +1544,14 @@ export async function startPool(client: PoolClient, toast: Toaster): Promise<Sta
         lock: (fn) => rotation.withLock(() => fn()),
       });
       if (adopted.status === "enrolled") {
-        console.error(
+        log("info",
           `[claude-pool] auto-enrolled "${adopted.label}" (${adopted.email}) from the Claude CLI`,
         );
         toast("success", `Added "${adopted.label}" (${adopted.email}) to the pool`);
       }
       if (adopted.status === "repaired") {
         await rotation.resetHealth(adopted.label!);
-        console.error(
+        log("info",
           `[claude-pool] re-enabled "${adopted.label}" (${adopted.email}) with the Claude CLI's new login`,
         );
         toast("success", `Re-enabled "${adopted.label}" (${adopted.email}) with the new login`);
@@ -1560,14 +1562,15 @@ export async function startPool(client: PoolClient, toast: Toaster): Promise<Sta
       await pool.sync();
       const shared = await labelSharingClaudeCliLogin(createAccountStore(createSecretBackend()));
       if (shared) {
-        console.error(`[claude-pool] ${sharedLoginWarning(shared)}`);
+        log("warn", `[claude-pool] ${sharedLoginWarning(shared)}`);
         toast("warning", sharedLoginWarning(shared));
       }
     }
   } catch (err) {
-    console.error(
-      `[claude-pool] disabled (${err instanceof Error ? err.message : String(err)})`,
-    );
+    const reason = err instanceof Error ? err.message : String(err);
+    notify("warning", `The account pool couldn't start (${truncate(reason, 80)}); the single login is used until it can.`, {
+      detail: `[claude-pool] disabled (${reason})`,
+    });
     poolActive = false;
   }
 
@@ -1587,13 +1590,13 @@ export async function startPool(client: PoolClient, toast: Toaster): Promise<Sta
         const note = active
           ? "Accounts enrolled — rotating across the pool"
           : "No accounts enrolled — using the single OpenCode login";
-        console.error(`[claude-pool] ${note}`);
+        log("info", `[claude-pool] ${note}`);
         toast("info", note);
       }
     } catch (err) {
       // Keep the last known mode: a locked keychain must not flip it back and forth.
       if (!poolCheckFailing) {
-        console.error(
+        log("warn",
           `[claude-pool] could not re-check enrolled accounts; keeping pool ${poolActive ? "on" : "off"}: ${err instanceof Error ? err.message : String(err)}`,
         );
       }
@@ -1608,6 +1611,7 @@ export async function startPool(client: PoolClient, toast: Toaster): Promise<Sta
 // ── Plugin ─────────────────────────────────────────────────────────
 
 const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
+  startNotices({ client, popup: createToaster(client, undefined, { title: "Claude bridge" }) });
   // Save ANTHROPIC_API_KEY so it can be restored if OAuth isn't active (API
   // key providers still work). A plugin re-created in this process sees the
   // placeholder an earlier loader exported, which is not the user's key.
@@ -1622,9 +1626,9 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
   const sessionId = SESSION_ID || randomUUID();
   const deviceId = getStableDeviceId();
 
-  const toast = createToaster(client);
-  warnOnce(
-    "build",
+  const toast = createToaster(client, undefined, { whenVisible: whenSessionActive });
+  if (once("build")) log(
+    "info",
     BUILD_IDENTITY
       ? `[opencode-claude-bridge] build ${BUILD_IDENTITY.version} (commit ${BUILD_IDENTITY.commit}${BUILD_IDENTITY.dirty ? " with uncommitted changes" : ""}, source ${BUILD_IDENTITY.sourceSha256})`
       : "[opencode-claude-bridge] build identity unknown: no BUILD-INFO.json beside the plugin (built without `npm run build`?)",
@@ -1662,6 +1666,10 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
   } catch {}
 
   return {
+    event: async ({ event }: { event?: { type?: unknown } }) => {
+      if (typeof event?.type === "string" && /^(session|message)\./.test(event.type)) markSessionActive();
+    },
+
     "experimental.chat.system.transform": (
       input: { model?: { providerID: string } },
       output: { system: string[] },
@@ -1758,12 +1766,12 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                 acquired = await untilAborted(pool.acquire(), signal);
               } catch (err) {
                 if (!(err instanceof LockTimeoutError)) throw err;
-                console.error(`[claude-pool] ${err.message}`);
+                log("warn", `[claude-pool] ${err.message}`);
                 return buildPoolBusyResponse();
               }
               if (acquired.kind === "exhausted") {
                 const message = pool.describeExhaustion(acquired.info);
-                console.error(`[claude-pool] ${message}`);
+                log("warn", `[claude-pool] ${message}`);
                 toast("warning", message, `exhausted:${acquired.info.earliestReset}`);
                 return buildPoolExhaustedResponse(
                   message,
@@ -1830,7 +1838,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
             }
 
             if (!usePool && response.status === 401) {
-              console.error("[opencode-claude-bridge] 401 from Anthropic; getting a fresh token and retrying once");
+              log("info", "[opencode-claude-bridge] 401 from Anthropic; getting a fresh token and retrying once");
               let freshToken: string;
               try {
                 const tokens = await account.tokens(auth, { rejected: accessToken, signal });
@@ -1876,7 +1884,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
               events.push({ kind: "retry", layer: "single", status: response.status, delayMs });
               const attempt = `attempt ${retry + 1}/${MAX_RESPONSE_RETRIES}`;
               if (response.status === 429) {
-                console.error(`[opencode-claude-bridge] 429 rate limited (${attempt}), retrying in ${Math.ceil(delayMs / 1000)}s`);
+                log("info", `[opencode-claude-bridge] 429 rate limited (${attempt}), retrying in ${Math.ceil(delayMs / 1000)}s`);
                 // Only a token about to expire is refreshed: each refresh spends
                 // the single-use refresh token.
                 if (expires < Date.now() + 60_000) {
@@ -1893,7 +1901,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                       throw err;
                     }
                     const detail = err instanceof Error ? err.message : String(err);
-                    console.error(`[opencode-claude-bridge] no fresh token after 429, returning it: ${detail}`);
+                    log("warn", `[opencode-claude-bridge] no fresh token after 429, returning it: ${detail}`);
                     events.push({ kind: "credential", reason: "rate-limited", outcome: "failed" });
                     break;
                   }
@@ -1901,7 +1909,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                   outHeaders["authorization"] = `Bearer ${freshToken}`;
                 }
               } else {
-                console.error(`[opencode-claude-bridge] ${response.status} overloaded (${attempt}), retrying in ${Math.ceil(delayMs / 1000)}s`);
+                log("info", `[opencode-claude-bridge] ${response.status} overloaded (${attempt}), retrying in ${Math.ceil(delayMs / 1000)}s`);
               }
               await response.body?.cancel();
               await abortableSleep(delayMs, signal);
@@ -1921,7 +1929,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
               inboundToolNameMap,
               translateToolArgs: (json: string, name: string) => inboundToolNameMap[name]
                 ? translateToolArgsJsonString(json, name, declaredToolFields[name]) : json,
-              debug: (msg: string) => console.error(`[opencode-claude-bridge] stream: ${msg}`),
+              debug: (msg: string) => log("debug", `[opencode-claude-bridge] stream: ${msg}`),
             };
             // Only what the bridge understands is rewritten: a JSON message as a
             // whole, an event stream event by event. Any other body is
@@ -1955,7 +1963,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
             try {
               callbackServer = await startOAuthCallbackServer();
             } catch (err) {
-              console.error(`[opencode-oauth] Failed to start callback server: ${err}`);
+              log("warn", `[opencode-oauth] Failed to start callback server: ${err}`);
             }
 
             if (callbackServer) {
@@ -1998,13 +2006,13 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
 
                     const pastedState = parsePastedState(manualInput);
                     if (pastedState !== null && pastedState !== state) {
-                      console.error("[opencode-oauth] Pasted code belongs to a different login attempt (state mismatch)");
+                      notify("error", "Claude sign-in failed: the pasted code is from a different sign-in attempt. Start the sign-in again and paste the code it gives you.", { detail: "[opencode-oauth] Pasted code belongs to a different login attempt (state mismatch)", now: true });
                       callbackServer?.close();
                       return { type: "failed" as const };
                     }
                     const code = parseAuthCode(manualInput);
                     if (!code) {
-                      console.error("[opencode-oauth] No authorization code received");
+                      notify("error", "Claude sign-in failed: no authorization code was received. Start the sign-in again.", { detail: "[opencode-oauth] No authorization code received", now: true });
                       callbackServer?.close();
                       return { type: "failed" as const };
                     }
@@ -2015,7 +2023,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                     callbackServer?.close();
                     return { type: "success" as const, ...tokens };
                   } catch (err) {
-                    console.error(`[opencode-oauth] Token exchange failed: ${err}`);
+                    notify("error", `Claude sign-in failed: ${truncate(err instanceof Error ? err.message : String(err), 120)}. Start the sign-in again.`, { detail: `[opencode-oauth] Token exchange failed: ${err}`, now: true });
                     callbackServer?.close();
                     return { type: "failed" as const };
                   }
@@ -2037,7 +2045,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                 try {
                   const pastedState = parsePastedState(code);
                   if (pastedState !== null && pastedState !== state) {
-                    console.error("[opencode-oauth] Pasted code belongs to a different login attempt (state mismatch)");
+                    notify("error", "Claude sign-in failed: the pasted code is from a different sign-in attempt. Start the sign-in again and paste the code it gives you.", { detail: "[opencode-oauth] Pasted code belongs to a different login attempt (state mismatch)", now: true });
                     return { type: "failed" as const };
                   }
                   // redirect_uri defaults to MANUAL_REDIRECT_URL in exchangeCodeForTokens
@@ -2045,7 +2053,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                   await account.recordLogin(tokens, "bridge");
                   return { type: "success" as const, ...tokens };
                 } catch (err) {
-                  console.error(`[opencode-oauth] Token exchange failed: ${err}`);
+                  notify("error", `Claude sign-in failed: ${truncate(err instanceof Error ? err.message : String(err), 120)}. Start the sign-in again.`, { detail: `[opencode-oauth] Token exchange failed: ${err}`, now: true });
                   return { type: "failed" as const };
                 }
               },

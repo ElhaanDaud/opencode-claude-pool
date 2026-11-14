@@ -1,6 +1,7 @@
 import { randomBytes, createHash } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { spawn } from "node:child_process";
+import { log } from "./notices.js";
 import { RETRYABLE_STATUSES, getTokenRetryDelayMs } from "./retry.js";
 import {
   CLIENT_ID,
@@ -190,7 +191,7 @@ async function curlPost(
       if (delayMs === null) return { status, body: responseBody };
       retryDelayMs = delayMs;
 
-      console.error(
+      log("info",
         `[opencode-oauth] Token endpoint ${status} (attempt ${attempt + 1}/${retries}), retrying...`,
       );
     } catch (err) {
@@ -263,7 +264,7 @@ export function parseTokenResponse(status: number, body: string, label: string):
   }
   const hasLifetime = typeof expiresIn === "number" && Number.isFinite(expiresIn) && expiresIn > 0;
   if (!hasLifetime) {
-    console.error(`[opencode-oauth] ${label} response has no valid expires_in; treating the token as valid for 5 minutes`);
+    log("warn", `[opencode-oauth] ${label} response has no valid expires_in; treating the token as valid for 5 minutes`);
   }
   const lifetimeMs = hasLifetime ? expiresIn * 1000 : FALLBACK_TOKEN_LIFETIME_MS;
   return { access, refresh, expires: Date.now() + lifetimeMs };

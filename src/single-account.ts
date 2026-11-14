@@ -24,6 +24,7 @@ import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 
 import { readClaudeCredentials } from "./keychain.js";
+import { log } from "./notices.js";
 import { refreshTokens } from "./oauth.js";
 import type { OAuthTokens } from "./oauth.js";
 import { LockTimeoutError, createRotationStateStore, defaultLockPath, defaultStatePath } from "./pool/rotation-state.js";
@@ -80,12 +81,26 @@ const replacedBy = new Map<string, OAuthTokens>();
  */
 function latestOf(tokens: OAuthTokens): OAuthTokens {
   let latest = tokens;
-  for (let hops = 0; hops < 64; hops++) {
+  const seen = new Set([tokens.refresh]);
+  for (;;) {
     const next = replacedBy.get(latest.refresh);
-    if (!next) break;
+    if (!next) return latest;
+    // An endpoint that stopped rotating refresh tokens would link a token to itself.
+    if (next.refresh === latest.refresh) return next;
+    // Every earlier token in a chain is spent, so a loop leaves none that is safe to send.
+    if (seen.has(next.refresh)) {
+      throw new CredentialUnavailableError(
+        "The refreshed Claude login's tokens loop back to one already used, so none of them is sent; sign in again with `opencode auth login`.",
+      );
+    }
+    seen.add(next.refresh);
     latest = next;
   }
-  return latest;
+}
+
+function producedHere(refresh: string): boolean {
+  for (const tokens of replacedBy.values()) if (tokens.refresh === refresh) return true;
+  return false;
 }
 
 export function defaultSingleAccountDir(): string {
@@ -178,10 +193,13 @@ export function createSingleAccount(opts: SingleAccountOptions) {
 
   function ownerOf(refresh: string | undefined): Owner {
     if (refresh === undefined) return "claude-cli";
-    // Refreshed here, or still the stored start of a chain whose refreshed
-    // tokens wait in the journal: the bridge's however many refreshes the
-    // failed saves took, which the bounded list below doesn't cover.
-    if (replacedBy.has(refresh) || readJournal()?.replaces === refresh) return "bridge";
+    // Spent or produced here, or named by a journal not yet cleared: the
+    // bridge's, however many refreshes failed saves took and whether or not
+    // the bounded record below could be written.
+    const journal = readJournal();
+    if (replacedBy.has(refresh) || producedHere(refresh) || journal?.replaces === refresh || journal?.tokens.refresh === refresh) {
+      return "bridge";
+    }
     return bridgeOwned().includes(fingerprint(refresh)) ? "bridge" : "claude-cli";
   }
 
@@ -192,17 +210,45 @@ export function createSingleAccount(opts: SingleAccountOptions) {
     writeDurably(ownersPath(), JSON.stringify({ bridge: owned }));
   }
 
+  /** Whether the record now names `refresh`. Until it does, the journal must stay: nothing else on disk says the login is OpenCode's own. */
+  function recordRefreshedAsOwned(refresh: string): boolean {
+    try {
+      recordBridgeOwned(refresh);
+      return true;
+    } catch (err) {
+      log("warn", `[opencode-claude-bridge] could not record the refreshed login as OpenCode's own; keeping the refresh journal in its place: ${firstLine(err)}`);
+      return false;
+    }
+  }
+
   // ── Journal: refreshed tokens on disk before the store has them ───
 
   interface Journal { tokens: OAuthTokens; replaces: string; writtenAt: number }
+  type JournalState = { kind: "absent" } | { kind: "unreadable"; reason: string } | { kind: "valid"; journal: Journal };
+
+  function journalState(): JournalState {
+    let raw: string;
+    try {
+      raw = fs.readFileSync(journalPath(), "utf8");
+    } catch (err) {
+      const code = err instanceof Error && "code" in err ? String(err.code) : "read failed";
+      return code === "ENOENT" ? { kind: "absent" } : { kind: "unreadable", reason: code };
+    }
+    let parsed: Journal;
+    try {
+      parsed = JSON.parse(raw) as Journal;
+    } catch {
+      // Not the parser's message: it quotes the file, which holds tokens.
+      return { kind: "unreadable", reason: "not valid JSON" };
+    }
+    return parsed?.tokens?.refresh && typeof parsed.replaces === "string"
+      ? { kind: "valid", journal: parsed }
+      : { kind: "unreadable", reason: "not a refresh journal" };
+  }
 
   function readJournal(): Journal | null {
-    try {
-      const parsed = JSON.parse(fs.readFileSync(journalPath(), "utf8")) as Journal;
-      return parsed?.tokens?.refresh && typeof parsed.replaces === "string" ? parsed : null;
-    } catch {
-      return null;
-    }
+    const state = journalState();
+    return state.kind === "valid" ? state.journal : null;
   }
 
   function clearJournal(): void {
@@ -213,16 +259,24 @@ export function createSingleAccount(opts: SingleAccountOptions) {
   function setAsideJournal(reason: string): void {
     const aside = `${journalPath()}.${randomUUID()}.stale`;
     fs.renameSync(journalPath(), aside);
-    console.error(`[opencode-claude-bridge] set aside the single-account refresh journal (${reason}): ${aside}`);
+    log("warn", `[opencode-claude-bridge] set aside the single-account refresh journal (${reason}): ${aside}`);
   }
 
   /** Caller holds the lock. Commits a journal left by a save that failed or a process that died. */
   async function replayJournalLocked(): Promise<void> {
-    const journal = readJournal();
-    if (!journal) return;
+    const state = journalState();
+    if (state.kind === "absent") return;
+    if (state.kind === "unreadable") {
+      // Refreshing without it would resend the spent token it replaced.
+      throw new CredentialUnavailableError(
+        `OpenCode's own Claude login is not being refreshed: its refresh journal ${journalPath()} can't be read (${state.reason}) ` +
+        "and may hold the login's only valid token. Repair the file or move it aside; if the login then stops working, sign in again with `opencode auth login`.",
+      );
+    }
+    const { journal } = state;
     const stored = asTokens(await opts.getAuth());
     if (stored?.refresh === journal.tokens.refresh) {
-      clearJournal();
+      if (recordRefreshedAsOwned(journal.tokens.refresh)) clearJournal();
       return;
     }
     if (stored?.refresh !== journal.replaces) {
@@ -237,20 +291,16 @@ export function createSingleAccount(opts: SingleAccountOptions) {
       try {
         writeJournal({ tokens: latest, replaces: journal.replaces, writtenAt: clock() });
       } catch (err) {
-        console.error(`[opencode-claude-bridge] could not journal the refreshed login: ${firstLine(err)}`);
+        log("warn", `[opencode-claude-bridge] could not journal the refreshed login: ${firstLine(err)}`);
       }
     }
-    try {
-      recordBridgeOwned(latest.refresh);
-    } catch (err) {
-      console.error(`[opencode-claude-bridge] could not record the refreshed login as OpenCode's own: ${firstLine(err)}`);
-    }
+    const recorded = recordRefreshedAsOwned(latest.refresh);
     try {
       await opts.save(latest);
-      clearJournal();
-      console.error("[opencode-claude-bridge] saved a refreshed login left in the journal");
+      if (recorded) clearJournal();
+      log("info", "[opencode-claude-bridge] saved a refreshed login left in the journal");
     } catch (err) {
-      console.error(`[opencode-claude-bridge] the refreshed login is still unsaved, kept in the journal: ${firstLine(err)}`);
+      log("warn", `[opencode-claude-bridge] the refreshed login is still unsaved, kept in the journal: ${firstLine(err)}`);
     }
   }
 
@@ -266,7 +316,7 @@ export function createSingleAccount(opts: SingleAccountOptions) {
         const current = await opts.getAuth();
         if (current?.type === "oauth" && current.refresh === stored?.refresh) {
           await opts.save(cli).catch((err) => {
-            console.error(`[opencode-claude-bridge] could not save the Claude Code login: ${firstLine(err)}`);
+            log("warn", `[opencode-claude-bridge] could not save the Claude Code login: ${firstLine(err)}`);
           });
         }
       }
@@ -295,13 +345,9 @@ export function createSingleAccount(opts: SingleAccountOptions) {
       writeJournal({ tokens: fresh, replaces: stored.refresh, writtenAt: clock() });
     } catch (err) {
       // Save anyway: skipping the store write would drop the only valid tokens.
-      console.error(`[opencode-claude-bridge] could not journal the refreshed login: ${firstLine(err)}`);
+      log("warn", `[opencode-claude-bridge] could not journal the refreshed login: ${firstLine(err)}`);
     }
-    try {
-      recordBridgeOwned(fresh.refresh);
-    } catch (err) {
-      console.error(`[opencode-claude-bridge] could not record the refreshed login as OpenCode's own: ${firstLine(err)}`);
-    }
+    const recorded = recordRefreshedAsOwned(fresh.refresh);
 
     // Read-compare-write, not an atomic swap: a change made by something that
     // doesn't take this lock (`opencode auth login` or `logout`) can still land
@@ -313,7 +359,7 @@ export function createSingleAccount(opts: SingleAccountOptions) {
       try {
         setAsideJournal(after ? "the stored login was replaced during the refresh" : "the login was removed or switched to an API key during the refresh");
       } catch (err) {
-        console.error(`[opencode-claude-bridge] could not set aside the refresh journal: ${firstLine(err)}`);
+        log("warn", `[opencode-claude-bridge] could not set aside the refresh journal: ${firstLine(err)}`);
       }
       if (!after) {
         throw new CredentialUnavailableError(
@@ -327,9 +373,9 @@ export function createSingleAccount(opts: SingleAccountOptions) {
 
     try {
       await opts.save(fresh);
-      clearJournal();
+      if (recorded) clearJournal();
     } catch (err) {
-      console.error(`[opencode-claude-bridge] refreshed tokens could not be saved; kept in the journal and saved on the next request: ${firstLine(err)}`);
+      log("warn", `[opencode-claude-bridge] refreshed tokens could not be saved; kept in the journal and saved on the next request: ${firstLine(err)}`);
     }
     return fresh;
   }
@@ -403,7 +449,7 @@ export function createSingleAccount(opts: SingleAccountOptions) {
           try {
             fs.rmSync(ownersPath(), { force: true });
           } catch (err) {
-            console.error(`[opencode-claude-bridge] could not clear the record of OpenCode's own logins: ${firstLine(err)}`);
+            log("warn", `[opencode-claude-bridge] could not clear the record of OpenCode's own logins: ${firstLine(err)}`);
           }
           return;
         }

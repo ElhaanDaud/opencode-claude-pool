@@ -17,7 +17,13 @@ export const TOAST_REPEAT_MS = 60_000;
 /** `dedupeKey` names the condition when its text changes over time, e.g. a countdown. */
 export type Toaster = (variant: ToastVariant, message: string, dedupeKey?: string) => void;
 
-export function createToaster(client: ToastClient, clock: Clock = () => Date.now()): Toaster {
+export interface ToasterOptions {
+  title?: string;
+  whenVisible?: (show: () => void) => void;
+}
+
+export function createToaster(client: ToastClient, clock: Clock = () => Date.now(), options: ToasterOptions = {}): Toaster {
+  const { title = "Claude pool", whenVisible = (show: () => void) => show() } = options;
   const lastShown = new Map<string, number>();
 
   return (variant, message, dedupeKey = message) => {
@@ -30,12 +36,14 @@ export function createToaster(client: ToastClient, clock: Clock = () => Date.now
     lastShown.set(key, now);
 
     // Fire-and-forget: a slow or absent TUI must never delay or fail a request.
-    void Promise.resolve()
-      .then(() =>
-        client.tui?.showToast?.({
-          body: { title: "Claude pool", message, variant, duration: POOL_TOAST_DURATION_MS },
-        }),
-      )
-      .catch(() => {});
+    whenVisible(() => {
+      void Promise.resolve()
+        .then(() =>
+          client.tui?.showToast?.({
+            body: { title, message, variant, duration: POOL_TOAST_DURATION_MS },
+          }),
+        )
+        .catch(() => {});
+    });
   };
 }

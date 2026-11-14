@@ -390,6 +390,21 @@ describe("captured Claude Code prompt", () => {
     assert.doesNotMatch(out, /Memory|projects|that session/);
   });
 
+  it("leaves out the memory section under the heading current Claude Code versions give it", () => {
+    const sent = capturedBlocksToSend([{
+      type: "text",
+      text: [
+        "# Using your tools", " - generic rule", "",
+        "# auto memory", "You have a persistent, file-based memory system at `/Users/x/.claude/projects/-Users-x-other/memory/`.",
+        "## Types of memory", " - user", "",
+        "# Environment", " - models",
+      ].join("\n"),
+    }]).map((block) => block.text).join("\n");
+    assert.match(sent, /# Using your tools/);
+    assert.match(sent, /# Environment/);
+    assert.doesNotMatch(sent, /memory|projects/i);
+  });
+
   it("keeps a section out when its heading and its text are in different blocks", () => {
     const sent = capturedBlocksToSend([
       { type: "text", text: "# Harness\n - generic rule" },

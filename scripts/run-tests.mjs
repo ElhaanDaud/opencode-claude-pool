@@ -9,7 +9,7 @@ const manifest = {
   "opencode2/tools.test.js": "fixture", "pool/classifier-live.test.js": "fixture",
   "pool/classifier.test.js": "fixture", "pool/selection.test.js": "fixture",
   "stream-adversarial.test.js": "fixture", "stream.test.js": "fixture", "validator-redaction.test.js": "fixture",
-  "keychain.test.js": "injected-boundary", "opencode2/server.test.js": "injected-boundary",
+  "keychain.test.js": "injected-boundary", "notices.test.js": "injected-boundary", "opencode2/server.test.js": "injected-boundary",
   "opencode2/shared.test.js": "injected-boundary", "opencode2/tui.test.js": "injected-boundary",
   "pool/bridge.test.js": "injected-boundary", "pool/enroll.test.js": "injected-boundary",
   "pool/manager.test.js": "injected-boundary", "pool/notify.test.js": "injected-boundary",

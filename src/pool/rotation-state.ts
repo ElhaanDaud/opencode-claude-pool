@@ -22,6 +22,7 @@ import os from "node:os";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 
+import { log } from "../notices.js";
 import { ROTATION_STATE_VERSION } from "./types.js";
 import type { AccountState, Clock, RotationState } from "./types.js";
 
@@ -124,7 +125,7 @@ export function createRotationStateStore(opts: RotationStateStoreOptions) {
     try {
       parsed = JSON.parse(raw);
     } catch {
-      console.error(
+      log("warn",
         `[claude-pool] rotation state at ${statePath} is malformed JSON; falling back to defaults`,
       );
       return null;
@@ -135,7 +136,7 @@ export function createRotationStateStore(opts: RotationStateStoreOptions) {
       parsed === null ||
       (parsed as RotationState).version !== ROTATION_STATE_VERSION
     ) {
-      console.error(
+      log("warn",
         `[claude-pool] rotation state at ${statePath} has an unsupported version; falling back to defaults`,
       );
       return null;
@@ -163,7 +164,7 @@ export function createRotationStateStore(opts: RotationStateStoreOptions) {
     if (state) return state;
     const aside = `${statePath}.corrupt-${clock()}`;
     fs.renameSync(statePath, aside);
-    console.error(`[claude-pool] moved unusable rotation state to ${aside}; starting fresh`);
+    log("warn", `[claude-pool] moved unusable rotation state to ${aside}; starting fresh`);
     return defaultRotationState();
   }
 
