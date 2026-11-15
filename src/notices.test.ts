@@ -177,4 +177,22 @@ describe("the OpenCode 1 plugin's messages", () => {
     assert.ok(logged.every((entry) => entry.service === "opencode-claude-bridge"));
     assert.deepEqual(stderr, []);
   });
+
+  it("say why the login couldn't be connected at startup", async (t) => {
+    const credentials = path.join(root, ".claude", ".credentials.json");
+    fs.mkdirSync(path.dirname(credentials), { recursive: true });
+    fs.writeFileSync(credentials, JSON.stringify({
+      claudeAiOauth: { accessToken: "cli-access", refreshToken: "cli-refresh", expiresAt: Date.now() + 3_600_000 },
+    }));
+    t.after(() => fs.rmSync(credentials, { force: true }));
+    const stderr = stderrOf(t);
+    const { client, logged } = opencodeClient();
+    client.auth.set = async () => ({ error: "storage is read-only" });
+
+    await plugin.server({ client });
+    await settle();
+
+    assert.ok(logged.some((entry) => entry.level === "warn" && /could not connect the Claude login at startup.*storage is read-only/.test(entry.message)));
+    assert.deepEqual(stderr, []);
+  });
 });

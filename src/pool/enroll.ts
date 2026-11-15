@@ -10,6 +10,7 @@ import type {
 import type { AccountStore } from "./manager.js";
 import type { RotationStateStore } from "./rotation-state.js";
 import { PROFILE_URL } from "../constants.js";
+import { mayCarryLogin } from "../request-policy.js";
 import { claudeCredentialsPath } from "../keychain.js";
 
 const CLAUDE_CLI_KEYCHAIN_SERVICE = "Claude Code-credentials";
@@ -155,7 +156,9 @@ export function readClaudeCliCredentialsRaw(): string {
  */
 export async function lookupEmail(accessToken: string): Promise<string | undefined> {
   try {
+    if (!mayCarryLogin(PROFILE_URL)) return undefined;
     const response = await fetch(PROFILE_URL, {
+      redirect: "manual",
       headers: {
         authorization: `Bearer ${accessToken}`,
         "content-type": "application/json",

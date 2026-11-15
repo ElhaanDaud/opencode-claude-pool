@@ -118,6 +118,14 @@ describe("host tool contracts", () => {
     assert.deepEqual(translate("Agent", { prompt: "new" }), { prompt: "new", subagent_type: "general" });
   });
 
+  it("drops any field the host's tool doesn't declare, not only the ones Claude Code's schema adds", () => {
+    const declared = getDeclaredFieldsForActiveOpenCodeTools([host("task", { prompt: field, subagent_type: field })]);
+    assert.deepEqual(
+      JSON.parse(translateToolArgsJsonString(JSON.stringify({ prompt: "p", subagent_type: "explore", description: "d", extra: 1 }), "Agent", declared.Agent)),
+      { prompt: "p", subagent_type: "explore" },
+    );
+  });
+
   it("sends a task call naming no agent as made when the host's task schema is in use", () => {
     const declared = getDeclaredFieldsForActiveOpenCodeTools([host("task", { prompt: field, category: field, subagent_type: field })]);
     assert.deepEqual(

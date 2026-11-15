@@ -4,6 +4,7 @@
  */
 
 import assert from "node:assert/strict";
+import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -143,6 +144,57 @@ describe("audit H1: stale lock reclaim requires a dead holder", () => {
     assert.equal(held.nonce, "live-holder");
   });
 
+  /** A live process that is not the lock's holder, as a reused pid would be. */
+  function otherProcess(t: TestContext): { pid: number; startedAt: string } {
+    const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30_000)"], { stdio: "ignore" });
+    t.after(() => child.kill());
+    const startedAt = execFileSync("ps", ["-o", "lstart=", "-p", String(child.pid)], { encoding: "utf8" }).trim();
+    return { pid: child.pid!, startedAt };
+  }
+
+  function writeLock(statePath: string, payload: Record<string, unknown>): void {
+    fs.mkdirSync(path.dirname(statePath), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(`${statePath}.lock`, JSON.stringify({ hostname: os.hostname(), acquiredAt: 0, ...payload }), { mode: 0o600 });
+  }
+
+  it("reclaims an aged lock whose pid now belongs to a process that started at another time", async (t) => {
+    const statePath = tempPath(t);
+    writeLock(statePath, { pid: otherProcess(t).pid, nonce: "reused-pid", startedAt: "Thu Jan  1 00:00:00 1970" });
+    let now = 10_000_000;
+    const store = createRotationStateStore({ path: statePath, clock: () => (now += 5), staleLockMs: 1_000, lockPollMs: 1, lockTimeoutMs: 40 });
+
+    let entered = false;
+    await store.withLock(() => { entered = true; });
+
+    assert.equal(entered, true);
+  });
+
+  it("does not reclaim an aged lock whose holder still runs with the start time it recorded", async (t) => {
+    const statePath = tempPath(t);
+    const holder = otherProcess(t);
+    writeLock(statePath, { pid: holder.pid, nonce: "live-holder", startedAt: holder.startedAt });
+    let now = 10_000_000;
+    const store = createRotationStateStore({ path: statePath, clock: () => (now += 5), staleLockMs: 1_000, lockPollMs: 1, lockTimeoutMs: 40 });
+
+    await assert.rejects(store.withLock(() => undefined), /timed out/);
+    assert.equal(JSON.parse(fs.readFileSync(`${statePath}.lock`, "utf8")).nonce, "live-holder");
+  });
+
+  it("reports why a stale lock can't be reclaimed instead of waiting it out as contention", { skip: process.getuid?.() === 0 ? "chmod does not stop root from writing" : false }, async (t) => {
+    const statePath = tempPath(t);
+    writeLock(statePath, { pid: 2, hostname: "some-other-host", acquiredAt: 1_000, nonce: "dead-holder" });
+    const dir = path.dirname(statePath);
+    let now = 10_000_000;
+    const store = createRotationStateStore({ path: statePath, clock: () => (now += 5), staleLockMs: 1_000, lockPollMs: 1, lockTimeoutMs: 40 });
+
+    fs.chmodSync(dir, 0o500);
+    try {
+      await assert.rejects(store.withLock(() => undefined), (err: unknown) => (err as NodeJS.ErrnoException).code === "EACCES");
+    } finally {
+      fs.chmodSync(dir, 0o700);
+    }
+  });
+
   it("still reclaims an aged lock from a process that is gone", async (t) => {
     const statePath = tempPath(t);
     fs.mkdirSync(path.dirname(statePath), { recursive: true, mode: 0o700 });
@@ -171,5 +223,37 @@ describe("audit H1: stale lock reclaim requires a dead holder", () => {
 
     assert.equal(entered, true);
     assert.equal(fs.existsSync(`${statePath}.lock`), false);
+  });
+});
+
+describe("the login goes only to trusted origins, and never through a redirect", () => {
+  const record = () => {
+    const calls: Array<{ url: string; redirect?: RequestRedirect }> = [];
+    const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+      calls.push({ url: String(url), redirect: init?.redirect });
+      return Response.json({ account: { email_address: "person@example.com" } });
+    }) as typeof fetch;
+    return { calls, fetchImpl };
+  };
+
+  it("doesn't look up the email at a profile URL that isn't trusted", async (t) => {
+    t.mock.method(console, "error", () => {});
+    process.env.ANTHROPIC_PROFILE_URL = "https://profile.example/api/oauth/profile";
+    t.after(() => { delete process.env.ANTHROPIC_PROFILE_URL; });
+    const { lookupEmail } = await import("./enroll.js");
+    const { calls, fetchImpl } = record();
+    t.mock.method(globalThis, "fetch", fetchImpl);
+    assert.equal(await lookupEmail("token"), undefined);
+    assert.deepEqual(calls, []);
+  });
+
+  it("doesn't ask an untrusted origin for usage, and asks a trusted one without following redirects", async (t) => {
+    t.mock.method(console, "error", () => {});
+    const { fetchUsage } = await import("./usage.js");
+    const { calls, fetchImpl } = record();
+    await assert.rejects(fetchUsage("token", { url: "https://usage.example/api/oauth/usage", fetchImpl }), /not sent/);
+    assert.deepEqual(calls, []);
+    await fetchUsage("token", { url: "https://api.anthropic.com/api/oauth/usage", fetchImpl });
+    assert.deepEqual(calls, [{ url: "https://api.anthropic.com/api/oauth/usage", redirect: "manual" }]);
   });
 });

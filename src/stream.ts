@@ -115,14 +115,22 @@ export function createSseProcessor(deps: StreamProcessorDeps) {
   type ToolBlockState = { toolName: string; partialJson: string; bytes: number };
   const toolBlocks = new Map<number, ToolBlockState>();
   let bufferedBytes = 0;
-  let sseBuffer = "";
+  // The incomplete frame, kept as received: joining and rescanning it per
+  // chunk made a large frame in small chunks cost quadratic time.
+  let pending: string[] = [];
+  let pendingBytes = 0;
   // The last chunk ended in "\r", so a leading "\n" completes that CRLF.
   let afterCR = false;
   let failed = false;
 
+  function clearPending(): void {
+    pending = [];
+    pendingBytes = 0;
+  }
+
   function fail(message: string): string {
     failed = true;
-    sseBuffer = "";
+    clearPending();
     toolBlocks.clear();
     bufferedBytes = 0;
     return errorEvent(message);
@@ -253,28 +261,42 @@ export function createSseProcessor(deps: StreamProcessorDeps) {
     // SSE allows CRLF, LF or CR line endings; frame and parse on LF only.
     const skip = afterCR && text.startsWith("\n") ? 1 : 0;
     if (text) afterCR = text.endsWith("\r");
-    sseBuffer += text.slice(skip).replace(/\r\n?/g, "\n");
+    const piece = text.slice(skip).replace(/\r\n?/g, "\n");
+    const tooLarge = (frameSize: number) => {
+      const tool = toolBlocks.values().next().value as ToolBlockState | undefined;
+      return fail(`SSE frame limit ${MAX_SSE_FRAME_BYTES} bytes exceeded: ${frameSize} bytes for ${safeToolName(tool?.toolName ?? "unknown")}`);
+    };
     let out = "";
+    let start = 0;
     while (true) {
-      const boundary = sseBuffer.indexOf("\n\n");
-      const frameSize = byteLength(boundary === -1 ? sseBuffer : sseBuffer.slice(0, boundary + 2));
-      if (frameSize > MAX_SSE_FRAME_BYTES) {
-        const tool = toolBlocks.values().next().value as ToolBlockState | undefined;
-        return out + fail(`SSE frame limit ${MAX_SSE_FRAME_BYTES} bytes exceeded: ${frameSize} bytes for ${safeToolName(tool?.toolName ?? "unknown")}`);
+      // A frame ends at a blank line, which may start in the previous chunk.
+      const spans = start === 0 && pending.at(-1)?.endsWith("\n") === true && piece.startsWith("\n");
+      const boundary = spans ? -1 : piece.indexOf("\n\n", start);
+      if (!spans && boundary === -1) {
+        const rest = piece.slice(start);
+        if (rest) {
+          pending.push(rest);
+          pendingBytes += byteLength(rest);
+        }
+        if (pendingBytes > MAX_SSE_FRAME_BYTES) return out + tooLarge(pendingBytes);
+        break;
       }
-      if (boundary === -1) break;
-      const block = sseBuffer.slice(0, boundary + 2);
-      sseBuffer = sseBuffer.slice(boundary + 2);
+      const tail = piece.slice(start, boundary + 2);
+      const frameSize = pendingBytes + byteLength(tail);
+      const block = pending.length ? pending.join("") + tail : tail;
+      clearPending();
+      if (frameSize > MAX_SSE_FRAME_BYTES) return out + tooLarge(frameSize);
       out += processEvent(block);
       if (failed) break;
+      start = boundary + 2;
     }
     return out;
   }
 
   function flush(): string {
     if (failed) return "";
-    const remaining = sseBuffer;
-    sseBuffer = "";
+    const remaining = pending.join("");
+    clearPending();
     afterCR = false;
     if (toolBlocks.size > 0) {
       // The upstream disconnected mid-tool_use without sending
@@ -294,7 +316,7 @@ export function createSseProcessor(deps: StreamProcessorDeps) {
 
   /** Drop buffered state after the consumer cancelled; nothing was abandoned. */
   function discard(): void {
-    sseBuffer = "";
+    clearPending();
     afterCR = false;
     toolBlocks.clear();
     bufferedBytes = 0;

@@ -540,6 +540,42 @@ describe("rotation manager keychain read failures", () => {
   });
 });
 
+describe("rotation manager login replaced during a refresh", () => {
+  it("refreshes a replacement that can't be used yet instead of handing out its expired token", async (t) => {
+    const replacement = record("alice", { access: "access-replaced", refresh: "refresh-replaced", expires: NOW - 1 });
+    const h: Harness = harness(t, [record("alice", { expires: NOW - 1 })], (token) => {
+      // An older version or a hand edit, neither of which takes the lock.
+      if (token === "refresh-alice") void h.accounts.putAccount(replacement);
+      return { access: `${token}/access`, refresh: `${token}/next`, expires: NOW + 3_600_000 };
+    });
+
+    const tokens = await h.manager.refreshLabel("alice");
+
+    assert.equal(tokens.access, "refresh-replaced/access");
+    assert.deepEqual(h.refreshCalls, ["refresh-alice", "refresh-replaced"]);
+    assert.equal((await h.accounts.getAccount("alice"))?.oauth.refresh, "refresh-replaced/next");
+    const aside = setAsideJournals(h.journalPath).map((file) => JSON.parse(fs.readFileSync(file, "utf8")).tokens.refresh);
+    assert.deepEqual(aside, ["refresh-alice/next"]);
+    assert.equal(fs.existsSync(h.journalPath), false);
+  });
+
+  it("sets aside the refreshed tokens themselves when their journal couldn't be written", async (t) => {
+    const replacement = record("alice", { access: "access-replaced", refresh: "refresh-replaced", expires: NOW + 3_600_000 });
+    const h: Harness = harness(t, [record("alice", { expires: NOW - 1 })], (token) => {
+      // The journal can't be written: something else occupies its path.
+      fs.mkdirSync(h.journalPath, { recursive: true });
+      void h.accounts.putAccount(replacement);
+      return { access: `${token}/access`, refresh: `${token}/next`, expires: NOW + 3_600_000 };
+    });
+
+    const tokens = await h.manager.refreshLabel("alice");
+
+    assert.equal(tokens.access, "access-replaced");
+    const aside = setAsideJournals(h.journalPath).map((file) => JSON.parse(fs.readFileSync(file, "utf8")).tokens.refresh);
+    assert.deepEqual(aside, ["refresh-alice/next"]);
+  });
+});
+
 describe("rotation manager journal replay", () => {
   it("commits a journal left behind by a crashed process", async (t) => {
     const h = harness(t, [record("alice")]);

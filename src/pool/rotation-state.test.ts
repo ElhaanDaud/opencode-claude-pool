@@ -46,6 +46,8 @@ function reclaimClaims(lockPath: string): string[] {
   return fs.readdirSync(path.dirname(lockPath)).filter((name) => name.includes(".reclaim-"));
 }
 
+const asRoot = process.getuid?.() === 0 ? "chmod does not stop root from reading or writing" : false;
+
 describe("rotation state persistence", () => {
   it("round-trips a saved state exactly", (t) => {
     const store = createRotationStateStore({ path: tempStatePath(t) });
@@ -120,7 +122,7 @@ describe("rotation state persistence", () => {
     });
   }
 
-  it("refuses to write over a state file it cannot read", async (t) => {
+  it("refuses to write over a state file it cannot read", { skip: asRoot }, async (t) => {
     const statePath = tempStatePath(t);
     const store = createRotationStateStore({ path: statePath, lockPollMs: 1 });
     await store.markDisabled("revoked", "refresh rejected");
@@ -139,7 +141,7 @@ describe("rotation state persistence", () => {
     assert.equal(store.load().accounts.revoked?.disabled, true);
   });
 
-  it("preserves the original file and removes temp files after a failed save", (t) => {
+  it("preserves the original file and removes temp files after a failed save", { skip: asRoot }, (t) => {
     const statePath = tempStatePath(t);
     const store = createRotationStateStore({ path: statePath });
     const original = populatedState();
@@ -204,7 +206,7 @@ describe("rotation state locking", () => {
 
   it("removes a newly created lock when writing it fails", async (t) => {
     const statePath = tempStatePath(t);
-    t.mock.method(fs, "writeSync", () => { throw new Error("write failed"); });
+    t.mock.method(fs, "writeFileSync", () => { throw new Error("write failed"); });
     const store = createRotationStateStore({ path: statePath });
     await assert.rejects(store.withLock(() => {}), /write failed/);
     assert.equal(fs.existsSync(`${statePath}.lock`), false);
@@ -483,6 +485,17 @@ describe("rotation state mutators", () => {
       assert.equal(Object.hasOwn(store.load().accounts, label), true);
       assert.equal(store.load().accounts[label]?.cooldownUntil, 12345);
     }
+  });
+
+  it("never shortens a cooldown already in force", async (t) => {
+    const store = createRotationStateStore({ path: tempStatePath(t), clock: () => 5000 });
+    await store.markCooldown("primary", 5000 + 5 * 3_600_000, "usage window rejected");
+    // A request sent before the cooldown comes back with a plain retry-after.
+    await store.markCooldown("primary", 5000 + 120_000, "Account rate limit resets in 120 seconds");
+    const account = store.load().accounts.primary;
+    assert.equal(account?.cooldownUntil, 5000 + 5 * 3_600_000);
+    assert.equal(account?.lastReason, "usage window rejected");
+    assert.equal(account?.failureCount, 2);
   });
 
   it("keeps a cooldown recorded in the same millisecond as a request", async (t) => {

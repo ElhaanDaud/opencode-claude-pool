@@ -37,6 +37,8 @@ process.env.HOME = scratch;
 process.env.CLAUDE_CONFIG_DIR = path.join(scratch, ".claude");
 process.env.ANTHROPIC_TOKEN_URL = `${local}/v1/oauth/token`;
 process.env.ANTHROPIC_PROFILE_URL = `${local}/api/oauth/profile`;
+// The profile lookup carries the login, so its stand-in origin must be trusted like any other.
+process.env.ANTHROPIC_TRUSTED_ORIGINS = local;
 // No captured Claude Code prompt, so OpenCode's own system prompt is normalised.
 process.env.ANTHROPIC_SYSTEM_PROMPT_PATH = path.join(scratch, "claude-system-prompt.json");
 process.env.ANTHROPIC_CLI_VERSION = "2.1.200";

@@ -3,6 +3,7 @@ export type HistoryRepairs = { synthesized: string[]; convertedResults: string[]
 
 const MISSING_RESULT = "The bridge added this result because no result for this call is in the conversation, possibly because context was compacted.";
 const ORPHAN_PREFIX = "The bridge converted this tool result because its matching call is not in the preceding assistant message.";
+const DUPLICATE_PREFIX = "The bridge converted this tool result because its call already has a result earlier in this turn.";
 
 function block(value: unknown): Record<string, unknown> | undefined {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
@@ -61,14 +62,19 @@ export function repairToolPairs(messages: HistoryMessage[]): { messages: History
       const present = new Set(ids(turn, "tool_result", "tool_use_id"));
       const missing = [...uses].filter((id) => !present.has(id));
       const converted: unknown[] = [];
+      const answered = new Set<string>();
       let convertedAny = false;
       for (const value of turn.flatMap((message) => blocksOf(message.content))) {
         const item = block(value);
-        if (item?.type === "tool_result" && typeof item.tool_use_id === "string" && !uses.has(item.tool_use_id)) {
-          repairs.convertedResults.push(item.tool_use_id);
+        const id = item?.type === "tool_result" && typeof item.tool_use_id === "string" ? item.tool_use_id : undefined;
+        // The API rejects a call answered twice as surely as one never made.
+        const prefix = id === undefined ? undefined : !uses.has(id) ? ORPHAN_PREFIX : answered.has(id) ? DUPLICATE_PREFIX : undefined;
+        if (id !== undefined && prefix === undefined) answered.add(id);
+        if (id !== undefined && prefix !== undefined) {
+          repairs.convertedResults.push(id);
           convertedAny = true;
-          const content = item.content;
-          converted.push({ type: "text", text: typeof content === "string" ? `${ORPHAN_PREFIX}\n${content}` : ORPHAN_PREFIX });
+          const content = item!.content;
+          converted.push({ type: "text", text: typeof content === "string" ? `${prefix}\n${content}` : prefix });
           if (Array.isArray(content)) converted.push(...content);
         } else converted.push(value);
       }

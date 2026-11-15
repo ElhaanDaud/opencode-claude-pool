@@ -44,7 +44,7 @@ import { translateJsonResponse, translateSseStream } from "./stream.js";
 import { repairToolPairs } from "./history.js";
 import type { HistoryRepairs } from "./history.js";
 import {
-  appendTrace, captureProvenance, capturedBlocksToSend, isTrustedDestination, limitCacheBreakpoints, traceableSetting,
+  appendTrace, captureProvenance, capturedBlocksToSend, isTrustedDestination, limitCacheBreakpoints, mayCarryLogin, traceableSetting,
   untrustedDestinationResponse,
 } from "./request-policy.js";
 import type { ChangeReason, RequestEvent, SettingChange } from "./request-policy.js";
@@ -960,7 +960,9 @@ async function fetchOAuthProfile(accessToken: string): Promise<OAuthProfile | nu
 
   const pending = (async () => {
     try {
+      if (!mayCarryLogin(PROFILE_URL)) return null;
       const response = await globalThis.fetch(PROFILE_URL, {
+        redirect: "manual",
         headers: {
           authorization: `Bearer ${accessToken}`,
           "content-type": "application/json",
@@ -1663,7 +1665,9 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
         await account.seedFromCli(readStoredAuth());
       }
     }
-  } catch {}
+  } catch (err) {
+    log("warn", `[opencode-claude-bridge] could not connect the Claude login at startup; the first request tries again: ${err instanceof Error ? err.message : String(err)}`);
+  }
 
   return {
     event: async ({ event }: { event?: { type?: unknown } }) => {

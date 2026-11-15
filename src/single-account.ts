@@ -27,6 +27,7 @@ import { readClaudeCredentials } from "./keychain.js";
 import { log } from "./notices.js";
 import { refreshTokens } from "./oauth.js";
 import type { OAuthTokens } from "./oauth.js";
+import { isCredentialRejected } from "./pool/manager.js";
 import { LockTimeoutError, createRotationStateStore, defaultLockPath, defaultStatePath } from "./pool/rotation-state.js";
 
 export type Owner = "bridge" | "claude-cli";
@@ -73,6 +74,8 @@ let flight: Promise<OAuthTokens> | null = null;
 const rejectedAccess = new Set<string>();
 /** Spent refresh token → what replaced it here, while the store still returns the spent one. */
 const replacedBy = new Map<string, OAuthTokens>();
+/** Refresh tokens the token endpoint refused, with its answer: sending one again only repeats it. */
+const refused = new Map<string, string>();
 
 /**
  * The newest tokens this process holds for a chain: a refresh whose save
@@ -127,7 +130,7 @@ function writeDurably(file: string, contents: string): void {
   try {
     const fd = fs.openSync(tmp, "wx", 0o600);
     try {
-      fs.writeSync(fd, contents);
+      fs.writeFileSync(fd, contents);
       fs.fsyncSync(fd);
     } finally {
       fs.closeSync(fd);
@@ -255,6 +258,18 @@ export function createSingleAccount(opts: SingleAccountOptions) {
     try { fs.rmSync(journalPath(), { force: true }); } catch { /* best effort */ }
   }
 
+  /** Out of the replay path but kept: they may be the only live tokens of the login they came from. */
+  function setAsideTokens(journal: Journal, reason: string): void {
+    if (readJournal()?.tokens.refresh === journal.tokens.refresh) {
+      setAsideJournal(reason);
+      return;
+    }
+    // Their journal write failed, so nothing on disk holds them yet.
+    const aside = `${journalPath()}.${randomUUID()}.stale`;
+    writeDurably(aside, JSON.stringify(journal));
+    log("warn", `[opencode-claude-bridge] set aside the refreshed single-account tokens (${reason}): ${aside}`);
+  }
+
   /** Rename, never delete: the journal may hold the only live token. Throws if it can't be moved. */
   function setAsideJournal(reason: string): void {
     const aside = `${journalPath()}.${randomUUID()}.stale`;
@@ -336,13 +351,27 @@ export function createSingleAccount(opts: SingleAccountOptions) {
     if (!stored) throw new CredentialUnavailableError("The Claude login was removed from OpenCode; sign in again.");
     if (ownerOf(stored.refresh) !== "bridge") return followCli(stored);
     const basis = latestOf(stored);
-    if (usable(basis)) return basis;
+    if (usable(basis)) {
+      if (basis !== stored && readJournal()?.tokens.refresh !== basis.refresh) await saveUnsaved(stored, basis);
+      return basis;
+    }
+    const refusal = refused.get(basis.refresh);
+    if (refusal !== undefined) throw refusedLogin(refusal);
 
-    const fresh = await refreshFn(basis.refresh);
+    let fresh: OAuthTokens;
+    try {
+      fresh = await refreshFn(basis.refresh);
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      if (!isCredentialRejected(detail)) throw err;
+      refused.set(basis.refresh, firstLine(err));
+      throw refusedLogin(firstLine(err));
+    }
     // The old refresh token is spent from here on, so these are the only valid tokens.
     replacedBy.set(basis.refresh, fresh);
+    const journal: Journal = { tokens: fresh, replaces: stored.refresh, writtenAt: clock() };
     try {
-      writeJournal({ tokens: fresh, replaces: stored.refresh, writtenAt: clock() });
+      writeJournal(journal);
     } catch (err) {
       // Save anyway: skipping the store write would drop the only valid tokens.
       log("warn", `[opencode-claude-bridge] could not journal the refreshed login: ${firstLine(err)}`);
@@ -357,9 +386,9 @@ export function createSingleAccount(opts: SingleAccountOptions) {
     const after = asTokens(await opts.getAuth());
     if (after?.refresh !== stored.refresh && after?.refresh !== fresh.refresh) {
       try {
-        setAsideJournal(after ? "the stored login was replaced during the refresh" : "the login was removed or switched to an API key during the refresh");
+        setAsideTokens(journal, after ? "the stored login was replaced during the refresh" : "the login was removed or switched to an API key during the refresh");
       } catch (err) {
-        log("warn", `[opencode-claude-bridge] could not set aside the refresh journal: ${firstLine(err)}`);
+        log("error", `[opencode-claude-bridge] could not set aside the refreshed tokens; they are lost: ${firstLine(err)}`);
       }
       if (!after) {
         throw new CredentialUnavailableError(
@@ -382,6 +411,33 @@ export function createSingleAccount(opts: SingleAccountOptions) {
 
   function writeJournal(journal: Journal): void {
     writeDurably(journalPath(), JSON.stringify(journal));
+  }
+
+  /**
+   * Tokens refreshed here that reached neither the journal nor storage. Until
+   * they do, another process finds only the spent token and sends it again.
+   */
+  async function saveUnsaved(stored: OAuthTokens, newest: OAuthTokens): Promise<void> {
+    try {
+      writeJournal({ tokens: newest, replaces: stored.refresh, writtenAt: clock() });
+    } catch (err) {
+      log("warn", `[opencode-claude-bridge] could not journal the refreshed login: ${firstLine(err)}`);
+    }
+    const recorded = recordRefreshedAsOwned(newest.refresh);
+    if (asTokens(await opts.getAuth())?.refresh !== stored.refresh) return;
+    try {
+      await opts.save(newest);
+      if (recorded) clearJournal();
+      log("info", "[opencode-claude-bridge] saved a refreshed login that couldn't be saved when it was issued");
+    } catch (err) {
+      log("warn", `[opencode-claude-bridge] the refreshed login is still unsaved: ${firstLine(err)}`);
+    }
+  }
+
+  function refusedLogin(why: string): CredentialUnavailableError {
+    return new CredentialUnavailableError(
+      `Anthropic refused the refresh of OpenCode's own Claude login (${why}), so it isn't sent again. Sign in again with \`opencode auth login\` (Claude Pro / Max).`,
+    );
   }
 
   async function locked<T>(fn: () => Promise<T>): Promise<T> {

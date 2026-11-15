@@ -44,10 +44,18 @@ function ttlOf(block: Block): string {
   return typeof marker === "object" && marker !== null && "ttl" in marker && marker.ttl === "1h" ? "1h" : "5m";
 }
 
+/** In prompt order. A tool result's own blocks count too: the API's limit covers every marker. */
 function markedInMessages(messages: unknown): Block[] {
   if (!Array.isArray(messages)) return [];
-  return messages.flatMap((message: unknown) =>
-    typeof message === "object" && message !== null && "content" in message ? marked(message.content) : []);
+  return messages.flatMap((message: unknown) => {
+    if (typeof message !== "object" || message === null || !("content" in message) || !Array.isArray(message.content)) return [];
+    return message.content.flatMap((value: unknown) => {
+      if (typeof value !== "object" || value === null) return [];
+      const block = value as Block;
+      const nested = block.type === "tool_result" ? marked(block.content) : [];
+      return "cache_control" in block ? [...nested, block] : nested;
+    });
+  });
 }
 
 /**
@@ -229,14 +237,20 @@ export function trustedOrigins(): Set<string> {
   const origins = new Set(DEFAULT_TRUSTED_ORIGINS);
   for (const entry of (process.env.ANTHROPIC_TRUSTED_ORIGINS ?? "").split(/[\s,]+/)) {
     if (!entry) continue;
+    let origin: string | undefined;
     try {
-      origins.add(new URL(entry).origin);
-    } catch {
-      if (once(`trusted-origin:${entry}`)) {
-        notify("warning", `ANTHROPIC_TRUSTED_ORIGINS entry "${entry}" isn't a URL, so it's ignored.`, {
-          detail: `[opencode-claude-bridge] ignoring ANTHROPIC_TRUSTED_ORIGINS entry that isn't a URL: ${entry}`,
-        });
-      }
+      origin = new URL(entry).origin;
+    } catch { /* reported below */ }
+    // file:, data: and the like have the opaque origin "null", which every such URL shares.
+    if (origin !== undefined && origin !== "null") {
+      origins.add(origin);
+      continue;
+    }
+    const problem = origin === undefined ? "isn't a URL" : "has no origin of its own (only http and https URLs do)";
+    if (once(`trusted-origin:${entry}`)) {
+      notify("warning", `ANTHROPIC_TRUSTED_ORIGINS entry "${entry}" ${problem}, so it's ignored.`, {
+        detail: `[opencode-claude-bridge] ignoring ANTHROPIC_TRUSTED_ORIGINS entry that ${problem}: ${entry}`,
+      });
     }
   }
   return origins;
@@ -248,6 +262,20 @@ export function isTrustedDestination(url: string): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * The fetch wrapper's rule for the bridge's own requests that carry the login
+ * (profile, usage): only to a trusted origin, and never through a redirect.
+ */
+export function mayCarryLogin(url: string): boolean {
+  if (isTrustedDestination(url)) return true;
+  let origin = url;
+  try { origin = new URL(url).origin; } catch { /* keep the raw value */ }
+  if (once(`untrusted-login-url:${origin}`)) {
+    notify("warning", `The bridge didn't send your Claude login to ${origin}: it isn't an Anthropic origin. If you trust it, add it to ANTHROPIC_TRUSTED_ORIGINS.`);
+  }
+  return false;
 }
 
 export function untrustedDestinationResponse(url: string): Response {

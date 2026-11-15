@@ -184,14 +184,18 @@ function durationFromMessage(message: unknown): number | undefined {
 function timestampFromMessage(message: unknown, now: number): number | undefined {
   try {
     if (typeof message !== "string") return undefined;
+    // A time already past (when the error happened, say) says nothing about the wait.
+    const ahead = (seconds: number | undefined) => (seconds !== undefined && seconds > 0 ? seconds : undefined);
 
     const timestamp = message.match(
       /\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})\b/i,
     )?.[0];
-    if (timestamp !== undefined) return normalizeResetValue(timestamp, now);
+    const fromTimestamp = timestamp === undefined ? undefined : ahead(normalizeResetValue(timestamp, now));
+    if (fromTimestamp !== undefined) return fromTimestamp;
 
-    const epoch = message.match(/\b\d{10,13}\b/)?.[0];
-    return epoch === undefined ? undefined : normalizeResetValue(epoch, now);
+    // Request ids and counts are long numbers too: only one the message calls a reset time counts.
+    const epoch = message.match(/\b(?:resets?|until|after|at)\s+(?:at\s+)?(\d{10,13})\b/i)?.[1];
+    return epoch === undefined ? undefined : ahead(normalizeResetValue(epoch, now));
   } catch {
     return undefined;
   }

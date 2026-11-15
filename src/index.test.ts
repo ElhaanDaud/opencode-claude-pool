@@ -35,7 +35,7 @@ import {
   normalizeSystemBlocks,
   supportsAdaptiveThinking,
 } from "./index.js";
-import { capturedBlocksToSend, captureProvenance, limitCacheBreakpoints, portableCapturedText } from "./request-policy.js";
+import { capturedBlocksToSend, captureProvenance, isTrustedDestination, limitCacheBreakpoints, portableCapturedText } from "./request-policy.js";
 import { createSseProcessor, parseSseEvent, buildSseEvent } from "./stream.js";
 
 // Simulate the body-transform logic from the fetch wrapper
@@ -349,6 +349,20 @@ describe("prompt-cache markers", () => {
     assert.equal(changes[0]?.reason, "compatibility");
   });
 
+  it("counts the markers inside a tool result's content", () => {
+    const parsed = {
+      system: [{ type: "text", text: "agent", cache_control: marker }],
+      messages: [{
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: "a", content: [1, 2, 3, 4].map((n) => ({ type: "text", text: `r${n}`, cache_control: marker })) }],
+      }],
+    };
+    const changes = limitCacheBreakpoints(parsed);
+    assert.deepEqual(parsed.messages[0]!.content[0]!.content.map((block) => "cache_control" in block), [false, true, true, true]);
+    assert.deepEqual(parsed.system[0]!.cache_control, marker);
+    assert.deepEqual([changes[0]?.from, changes[0]?.to], ["5 markers", "4 markers"]);
+  });
+
   it("counts a top-level cache_control (automatic caching) as one of the four", () => {
     const parsed = {
       cache_control: marker,
@@ -375,6 +389,18 @@ describe("prompt-cache markers", () => {
     assert.deepEqual(parsed.messages[0]!.content[0]!.cache_control, marker);
     assert.equal(changes.length, 1);
     assert.match(changes[0]!.note!, /1h markers before 5m ones; dropped 1 5m marker$/);
+  });
+});
+
+describe("trusted destinations", () => {
+  it("ignores an entry with no origin of its own, which would trust every such URL", (t) => {
+    t.mock.method(console, "error", () => {});
+    process.env.ANTHROPIC_TRUSTED_ORIGINS = "file:///tmp/x data:text/plain,y https://proxy.example:8443/path";
+    t.after(() => { delete process.env.ANTHROPIC_TRUSTED_ORIGINS; });
+    assert.equal(isTrustedDestination("data:text/plain,anything"), false);
+    assert.equal(isTrustedDestination("file:///etc/hosts"), false);
+    assert.equal(isTrustedDestination("https://proxy.example:8443/v1/messages"), true);
+    assert.equal(isTrustedDestination("https://api.anthropic.com/v1/messages"), true);
   });
 });
 

@@ -9,7 +9,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
 
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const options = { dist: path.join(repo, 'dist'), omo: 'file:///Users/apple/.config/opencode/omo-gpt61-4.19.4/dist/index.js', mode: 'both', out: path.join(os.tmpdir(), 'qa-opencode1-report.json'), keep: false, userPlugins: false };
+const options = { dist: path.join(repo, 'dist'), omo: undefined, mode: 'both', out: path.join(os.tmpdir(), 'qa-opencode1-report.json'), keep: false, userPlugins: false };
 const usage = 'Usage: node scripts/qa-opencode1.mjs [--dist <absolute-dir>] [--omo <file-url> | --no-omo] [--mode oauth|apikey|both] [--out <file>] [--keep] [--with-user-plugins]';
 for (let i = 2; i < process.argv.length; i++) {
   const arg = process.argv[i];
@@ -19,6 +19,27 @@ for (let i = 2; i < process.argv.length; i++) {
   else if (arg === '--no-omo') options.omo = null;
   else if (['--dist', '--omo', '--mode', '--out'].includes(arg) && process.argv[i + 1] && !process.argv[i + 1].startsWith('--')) options[arg.slice(2)] = process.argv[++i];
   else { console.error(`Invalid argument: ${arg}\n${usage}`); process.exit(2); }
+}
+/** The OhMyOpenCode build the user's OpenCode loads: a configured file: plugin whose package is oh-my-open*. */
+function configuredOmo() {
+  for (const name of ['opencode.jsonc', 'opencode.json']) {
+    let text;
+    try { text = fs.readFileSync(path.join(os.homedir(), '.config', 'opencode', name), 'utf8'); } catch { continue; }
+    const list = text.match(/"plugin"\s*:\s*\[([\s\S]*?)\]/)?.[1] ?? '';
+    for (const [, entry] of list.matchAll(/"(file:[^"]+)"/g)) {
+      for (let dir = path.dirname(fileURLToPath(entry)), up = 0; up < 3; up++, dir = path.dirname(dir)) {
+        let pkg;
+        try { pkg = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8')); } catch { continue; }
+        if (/^oh-my-open/.test(pkg.name ?? '')) return entry;
+        break;
+      }
+    }
+  }
+  return null;
+}
+if (options.omo === undefined) {
+  options.omo = configuredOmo();
+  if (!options.omo) { console.error(`No OhMyOpenCode plugin found in ~/.config/opencode/opencode.json(c); pass --omo <file-url> or --no-omo.\n${usage}`); process.exit(2); }
 }
 if (!path.isAbsolute(options.dist) || !['oauth', 'apikey', 'both'].includes(options.mode) || (options.omo && !options.omo.startsWith('file:'))) {
   console.error(usage); process.exit(2);
@@ -173,9 +194,9 @@ async function runMode(mode) {
     if (!safe) return recorded;
     const wrapper = path.join(config, 'opencode', 'wrapper.mjs');
     fs.writeFileSync(wrapper, `export { default } from ${JSON.stringify(pathToFileURL(path.join(options.dist, 'index.js')).href)};\n`);
-    const extra = options.userPlugins ? ['file:///Users/apple/.config/opencode/cursor-auth-wrapper.mjs', 'opencode-kiro@0.4.0'] : [];
+    const extra = options.userPlugins ? [pathToFileURL(path.join(os.homedir(), '.config', 'opencode', 'cursor-auth-wrapper.mjs')).href, 'opencode-kiro@0.4.0'] : [];
     if (options.userPlugins) {
-      const source = '/Users/apple/.cache/opencode/packages/opencode-kiro@0.4.0';
+      const source = path.join(os.homedir(), '.cache', 'opencode', 'packages', 'opencode-kiro@0.4.0');
       const dest = path.join(cache, 'opencode', 'packages', 'opencode-kiro@0.4.0');
       fs.mkdirSync(path.dirname(dest), { recursive: true });
       fs.cpSync(source, dest, { recursive: true });

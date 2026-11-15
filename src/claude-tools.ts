@@ -284,6 +284,12 @@ export function translateToolArgsJsonString(
     // agent (OMO: providing both is rejected). Default only when neither given.
     out.subagent_type = "general";
   }
+  // With the host's own schema in use, it alone says what the tool accepts.
+  if (declared && declared.size > 0) {
+    for (const key of Object.keys(out)) {
+      if (!declared.has(key)) delete out[key];
+    }
+  }
 
   return JSON.stringify(out);
 }

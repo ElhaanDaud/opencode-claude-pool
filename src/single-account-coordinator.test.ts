@@ -14,6 +14,7 @@ import type { StoredLogin } from "./single-account.js";
 import type { OAuthTokens } from "./oauth.js";
 
 const HOUR = 3_600_000;
+const asRoot = process.getuid?.() === 0 ? "chmod does not stop root from writing" : false;
 
 function setup(t: TestContext, stored: StoredLogin) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "single-account-"));
@@ -208,7 +209,7 @@ describe("single-account coordinator", () => {
     assert.equal(store.auth?.refresh, "v0++");
   });
 
-  it("never resends a refresh token it already spent, even when nothing can be written", async (t) => {
+  it("never resends a refresh token it already spent, even when nothing can be written", { skip: asRoot }, async (t) => {
     const { dir, store, own } = setup(t, { type: "oauth", access: "w0/access", refresh: "w0", expires: 0 });
     own("w0");
     const endpoint = tokenEndpoint("w0");
@@ -230,7 +231,7 @@ describe("single-account coordinator", () => {
     assert.deepEqual(endpoint.exchanges, ["w0", "w0+", "w0++"]);
   });
 
-  it("saves the newest tokens, not an older journal, once storage is back", async (t) => {
+  it("saves the newest tokens, not an older journal, once storage is back", { skip: asRoot }, async (t) => {
     const { dir, store, own } = setup(t, { type: "oauth", access: "j0/access", refresh: "j0", expires: 0 });
     own("j0");
     const endpoint = tokenEndpoint("j0");
@@ -337,6 +338,75 @@ describe("single-account coordinator", () => {
     assert.equal(account.ownerOf("kept-r"), "bridge");
   });
 
+  it("keeps the refreshed tokens in a .stale file when the login is replaced and their journal couldn't be written", async (t) => {
+    const { dir, store, own, journal } = setup(t, { type: "oauth", access: "a", refresh: "lost-r", expires: 0 });
+    own("lost-r");
+    const account = createSingleAccount({
+      getAuth: async () => store.auth,
+      save: async (tokens) => { store.auth = { type: "oauth", ...tokens }; },
+      readCli: () => null,
+      refresh: async () => {
+        fs.mkdirSync(journal);
+        store.auth = { type: "oauth", access: "lost-other", refresh: "lost-other-r", expires: Date.now() + HOUR };
+        return { access: "lost-fresh", refresh: "lost-fresh-r", expires: Date.now() + HOUR };
+      },
+      withLock: direct,
+      dir,
+    });
+    assert.equal((await account.tokens(store.auth)).access, "lost-other");
+    assert.deepEqual(asideIn(dir), ["lost-fresh-r"]);
+  });
+
+  it("saves tokens neither the journal nor storage took at the next request, before another process can spend the old ones", { skip: asRoot }, async (t) => {
+    const { dir, store, own } = setup(t, { type: "oauth", access: "gap0/access", refresh: "gap0", expires: 0 });
+    own("gap0");
+    const endpoint = tokenEndpoint("gap0");
+    let storageUp = false;
+    const options = {
+      getAuth: async () => store.auth,
+      save: async (tokens: OAuthTokens) => {
+        if (!storageUp) throw new Error("storage unavailable");
+        store.auth = { type: "oauth", ...tokens };
+      },
+      readCli: () => null,
+      refresh: endpoint.refresh,
+      withLock: direct,
+      dir,
+    };
+    const account = createSingleAccount(options);
+    fs.chmodSync(dir, 0o500);
+    try {
+      assert.equal((await account.tokens(store.auth)).refresh, "gap0+");
+    } finally {
+      fs.chmodSync(dir, 0o700);
+    }
+    storageUp = true;
+    assert.equal((await account.tokens(store.auth)).refresh, "gap0+");
+    assert.equal(store.auth?.refresh, "gap0+");
+
+    const other = await import(new URL("./single-account.js?other-process-gap", import.meta.url).href) as typeof import("./single-account.js");
+    assert.equal((await other.createSingleAccount(options).tokens(store.auth)).refresh, "gap0+");
+    assert.deepEqual(endpoint.exchanges, ["gap0"]);
+  });
+
+  it("never resends a refresh token the token endpoint refused", async (t) => {
+    const { dir, store, own } = setup(t, { type: "oauth", access: "a", refresh: "refused-r", expires: 0 });
+    own("refused-r");
+    const endpoint = tokenEndpoint();
+    const account = createSingleAccount({
+      getAuth: async () => store.auth,
+      save: async (tokens) => { store.auth = { type: "oauth", ...tokens }; },
+      readCli: () => null,
+      refresh: endpoint.refresh,
+      withLock: direct,
+      dir,
+    });
+    for (let i = 0; i < 3; i++) {
+      await assert.rejects(account.tokens(store.auth), (err: unknown) => err instanceof CredentialUnavailableError && /invalid_grant/.test(String(err)));
+    }
+    assert.deepEqual(endpoint.exchanges, ["refused-r"]);
+  });
+
   function refreshBlockingOwnerRecord(dir: string, refresh: (token: string) => Promise<OAuthTokens>) {
     const owners = path.join(dir, "single-account-owner.json");
     return async (token: string) => {
@@ -441,7 +511,7 @@ describe("single-account coordinator", () => {
     });
   }
 
-  it("never resends a spent refresh token however many refreshes go unsaved", async (t) => {
+  it("never resends a spent refresh token however many refreshes go unsaved", { skip: asRoot }, async (t) => {
     t.mock.method(console, "error", () => {});
     const { dir, store, own } = setup(t, { type: "oauth", access: "long0/access", refresh: "long0", expires: 0 });
     own("long0");

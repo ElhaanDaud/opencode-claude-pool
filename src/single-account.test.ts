@@ -26,6 +26,7 @@ Object.defineProperty(process, "platform", { value: "linux" });
 const liveRefreshTokens = new Set<string>();
 const refreshRequests: string[] = [];
 let tokenDelayMs = 0;
+let onRefresh: ((token: string) => void) | undefined;
 const tokenServer = http.createServer((req, res) => {
   let raw = "";
   req.on("data", (chunk) => { raw += chunk; });
@@ -33,6 +34,7 @@ const tokenServer = http.createServer((req, res) => {
     if (tokenDelayMs) await new Promise((resolve) => setTimeout(resolve, tokenDelayMs));
     const token = String(JSON.parse(raw).refresh_token);
     refreshRequests.push(token);
+    onRefresh?.(token);
     res.setHeader("content-type", "application/json");
     if (!liveRefreshTokens.delete(token)) {
       res.statusCode = 400;
@@ -275,6 +277,25 @@ describe("single-account refresh", () => {
     assert.equal(response.status, 200);
     assert.deepEqual(sent, [{ bearer: "Bearer identity-a", uuid: "uuid-a" }, { bearer: "Bearer identity-b", uuid: "uuid-b" }]);
   });
+  it("answers a retryable 503 when the login is replaced mid-refresh by one that has already expired", async () => {
+    liveRefreshTokens.add("swap-plugin");
+    ownedByBridge("swap-plugin");
+    const store = { auth: { type: "oauth", access: "old", refresh: "swap-plugin", expires: Date.now() - 1000 } };
+    const { loaded } = await connect(store, async (body) => { store.auth = body; });
+    onRefresh = (token) => {
+      if (token === "swap-plugin") store.auth = { type: "oauth", access: "replaced", refresh: "replaced-r", expires: Date.now() - 1000 };
+    };
+    try {
+      const response = await loaded.fetch("https://api.anthropic.com/v1/messages", { method: "POST", body: JSON.stringify(plain) });
+      assert.equal(response.status, 503);
+      assert.equal(response.headers.get("retry-after"), "5");
+      assert.match(await response.text(), /replaced while it was being refreshed/);
+      assert.equal(store.auth.refresh, "replaced-r");
+    } finally {
+      onRefresh = undefined;
+    }
+  });
+
   it("shares one refresh of a login OpenCode owns between concurrent requests", async () => {
     liveRefreshTokens.add("shared");
     ownedByBridge("shared");
@@ -1004,6 +1025,15 @@ describe("OAuth profile lookup", () => {
     const { statuses, lookups } = await sendAs("failed-profile", 2, async () => new Response("{}", { status: 500 }));
     assert.deepEqual(statuses, [200, 200]);
     assert.equal(lookups, 1);
+  });
+
+  it("never follows a redirect with the login", async () => {
+    let redirect: RequestRedirect | undefined;
+    await sendAs("redirect-profile", 1, async (init) => {
+      redirect = init?.redirect;
+      return new Response(null, { status: 302, headers: { location: "https://elsewhere.example/profile" } });
+    });
+    assert.equal(redirect, "manual");
   });
 });
 

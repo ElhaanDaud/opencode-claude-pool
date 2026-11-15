@@ -20,6 +20,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 
 import { log } from "../notices.js";
@@ -48,6 +49,28 @@ interface LockPayload {
   acquiredAt: number;
   /** Distinguishes our lock from a replacement, for safe reclaim and release. */
   nonce: string;
+  /** The holder's start time as `ps` reports it: tells the holder from a later process given its pid. */
+  startedAt?: string;
+}
+
+/** As `ps` reports it, or null where it can't. The kernel's record, so a clock change can't alter it. */
+function processStart(pid: number): string | null {
+  try {
+    const out = execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], {
+      encoding: "utf8",
+      timeout: 2000,
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    return out || null;
+  } catch {
+    return null;
+  }
+}
+
+let ownStart: string | null | undefined;
+function ownStartTime(): string | null {
+  if (ownStart === undefined) ownStart = processStart(process.pid);
+  return ownStart;
 }
 
 export function defaultRotationState(): RotationState {
@@ -174,7 +197,7 @@ export function createRotationStateStore(opts: RotationStateStoreOptions) {
     let fd: number | undefined;
     try {
       fd = fs.openSync(tmp, "wx", 0o600);
-      fs.writeSync(fd, JSON.stringify(state, null, 2));
+      fs.writeFileSync(fd, JSON.stringify(state, null, 2));
       // fsync before rename: rename atomically swaps the directory entry, but
       // without fsync the contents may not have reached disk yet.
       fs.fsyncSync(fd);
@@ -223,11 +246,13 @@ export function createRotationStateStore(opts: RotationStateStoreOptions) {
   /** Atomically create the lockfile. Returns our nonce, or null if held. */
   function tryCreateLock(): string | null {
     const nonce = randomUUID();
+    const startedAt = ownStartTime();
     const payload: LockPayload = {
       pid: process.pid,
       hostname: os.hostname(),
       acquiredAt: clock(),
       nonce,
+      ...(startedAt ? { startedAt } : {}),
     };
     let fd: number;
     try {
@@ -238,7 +263,7 @@ export function createRotationStateStore(opts: RotationStateStoreOptions) {
       throw err;
     }
     try {
-      fs.writeSync(fd, JSON.stringify(payload));
+      fs.writeFileSync(fd, JSON.stringify(payload));
       fs.fsyncSync(fd);
     } catch (err) {
       try { fs.rmSync(lockPath, { force: true }); } catch { /* best effort */ }
@@ -278,19 +303,25 @@ export function createRotationStateStore(opts: RotationStateStoreOptions) {
     if (payload.hostname !== os.hostname()) return true;
     try {
       process.kill(payload.pid, 0);
-      return false;
     } catch (error) {
       // EPERM: the process exists but belongs to another user (e.g. a service account).
-      return (error as NodeJS.ErrnoException).code !== "EPERM";
+      if ((error as NodeJS.ErrnoException).code !== "EPERM") return true;
     }
+    // Something runs under that pid, but pids are reused, after a reboot most of
+    // all: a process that started at another time is not the holder.
+    if (typeof payload.startedAt !== "string") return false;
+    const current = processStart(payload.pid);
+    return current !== null && current !== payload.startedAt;
   }
 
   function tryReclaimStale(observed: Buffer, identity?: fs.Stats): boolean {
     const claim = reclaimPath(observed);
     try {
       fs.closeSync(fs.openSync(claim, "wx", 0o600));
-    } catch {
-      return false; // Another waiter is reclaiming this lock.
+    } catch (err) {
+      // Anything but another waiter reclaiming it (EEXIST) is a real fault, not contention.
+      if ((err as NodeJS.ErrnoException).code === "EEXIST") return false;
+      throw err;
     }
     try {
       // Any mismatch means it was already reclaimed and replaced.
@@ -301,8 +332,9 @@ export function createRotationStateStore(opts: RotationStateStoreOptions) {
       }
       fs.rmSync(lockPath);
       return true;
-    } catch {
-      return false;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return false; // Already reclaimed.
+      throw err;
     } finally {
       try { fs.rmSync(claim, { force: true }); } catch { /* best effort */ }
     }
@@ -328,7 +360,10 @@ export function createRotationStateStore(opts: RotationStateStoreOptions) {
         try {
           const identity = fs.statSync(lockPath);
           if (raw && clock() - identity.mtimeMs > staleLockMs) tryReclaimStale(raw, identity);
-        } catch { /* The lock may have disappeared; the deadline still applies. */ }
+        } catch (err) {
+          // The lock may have disappeared; the deadline still applies.
+          if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+        }
       } else if (clock() - existing.acquiredAt > staleLockMs && holderIsGone(existing)) {
         if (tryReclaimStale(raw)) {
           const reclaimed = tryCreateLock();
@@ -431,9 +466,13 @@ export function createRotationStateStore(opts: RotationStateStoreOptions) {
       },
     ): Promise<void> {
       await mutateAccount(label, (account, now) => {
-        account.cooldownUntil = until;
+        // Only ever extended: a request already in flight can report a shorter
+        // wait (a plain retry-after) for an account whose window is spent for hours.
+        if (account.cooldownUntil === null || until > account.cooldownUntil) {
+          account.cooldownUntil = until;
+          account.lastReason = reason;
+        }
         account.failureCount += 1;
-        account.lastReason = reason;
         account.updatedAt = now;
         // Only overwrite a window we actually observed; a 429 that disclosed
         // one window must not erase what we already know about the other.

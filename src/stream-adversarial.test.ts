@@ -163,3 +163,16 @@ it("passes a JSON body it does not translate through with its exact bytes", asyn
   const translated = await translateJsonResponse(response, deps);
   assert.deepEqual([...new Uint8Array(await translated.arrayBuffer())], bytes);
 });
+
+it("takes linear time over a large frame that arrives in small chunks", () => {
+  const p = createSseProcessor(deps);
+  const frame = `event: ping\ndata: ${JSON.stringify({ type: "ping", pad: "x".repeat(1024 * 1024) })}\n\n`;
+  let out = "";
+  const startedAt = performance.now();
+  for (let at = 0; at < frame.length; at += 64) out += p.feedChunk(frame.slice(at, at + 64));
+  // Rescanning the whole buffer per chunk took over 10 s here; a linear pass takes milliseconds.
+  assert.ok(performance.now() - startedAt < 2_000, `${Math.round(performance.now() - startedAt)} ms`);
+  assert.equal(out, frame);
+  assert.equal(p.feedChunk(ev("ping", {}) + "\r\n"), ev("ping", {}));
+  assert.equal(p.flush(), "\n");
+});

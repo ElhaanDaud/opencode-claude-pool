@@ -253,6 +253,33 @@ describe("classify", () => {
     assert.equal(decision.until, NOW + 2 * 60 * 60 * 1000);
   });
 
+  it("never reads an id in the message as a reset time", () => {
+    const decision = classify(
+      input({ bodyText: JSON.stringify({ error: { message: "Rate limited; retry in 5 minutes (request 1700000000)" } }) }),
+    );
+
+    assert.equal(decision.action, "ROTATE_COOLDOWN");
+    assert.equal(decision.until, NOW + 5 * 60 * 1000);
+    assert.equal(decision.source, "body-hint");
+  });
+
+  it("reads an epoch the message calls a reset time", () => {
+    const resetAt = Math.floor((NOW + 2 * 60 * 60 * 1000) / 1000);
+    const decision = classify(
+      input({ bodyText: JSON.stringify({ error: { message: `Usage limit reached; resets at ${resetAt}` } }) }),
+    );
+
+    assert.equal(decision.until, NOW + 2 * 60 * 60 * 1000);
+  });
+
+  it("ignores a time in the message that has already passed", () => {
+    const decision = classify(
+      input({ bodyText: JSON.stringify({ error: { message: "Rejected at 2026-01-01T00:00:00Z; retry in 2 hours" } }) }),
+    );
+
+    assert.equal(decision.until, NOW + 2 * 60 * 60 * 1000);
+  });
+
   it("ignores a duration not introduced by in or after", () => {
     const decision = classify(
       input({ bodyText: JSON.stringify({ error: { message: "Limit is 50 messages per 5h" } }) }),

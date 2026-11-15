@@ -176,7 +176,7 @@ Anthropic rotates the refresh token on every refresh and kills the old one at on
 | An enrolled pool account | the pool only | see [Refresh tokens rotate](#refresh-tokens-rotate) |
 
 - A login whose owner the bridge never recorded (one stored by an older version) is treated as a Claude Code copy: its refresh token may already be spent, and resending a spent token can look like token theft.
-- OpenCode's own login never borrows Claude Code's token, even if Claude Code is logged into a valid account and OpenCode's is rejected; the request fails and says how to sign in again. Following the Claude CLI to whatever account it is logged into happens only for the Claude Code copy, and each request's `metadata.user_id` names the account whose token it carries.
+- OpenCode's own login never borrows Claude Code's token, even if Claude Code is logged into a valid account and OpenCode's is rejected; the request fails and says how to sign in again. A refresh token Anthropic refuses (`invalid_grant`) is not sent again by that process: later requests fail at once with the same advice. Following the Claude CLI to whatever account it is logged into happens only for the Claude Code copy, and each request's `metadata.user_id` names the account whose token it carries.
 - `claude-pool enroll` hands a login to the pool. Run `claude login` again afterwards so Claude Code has a chain of its own; `claude-pool` warns when the two still share one.
 - Startup copies Claude Code's login into OpenCode's store, but never over a login of OpenCode's own.
 - A sign-in whose save fails changes nothing: the login stored before it keeps its owner, so OpenCode's own is still refreshed.
@@ -195,7 +195,7 @@ Every outbound OAuth request is rewritten to match what Claude Code sends on the
 - **Headers** — `user-agent`, `anthropic-beta`, `anthropic-version`, `x-app`, `x-stainless-*`, `x-claude-code-session-id` and `anthropic-dangerous-direct-browser-access`; `x-api-key` is removed. The billing metadata (`cc_version`, `cc_entrypoint`, `cch`) is not a header: it is sent as the first system block (`x-anthropic-billing-header: …`).
 - **Body fields** — `metadata` (session ID, billing info) and the `?beta=true` URL parameter; defaults for `thinking`, `output_config.effort` and `context_management` only where the caller set none (see [Model handling](#model-handling)).
 - **System prompt** — the billing block and Claude Code's identity line lead. If a Claude Code prompt was captured with the validator (`~/.cache/opencode-claude-bridge/claude-system-prompt.json`), its sections that describe Claude Code follow; its memory section (`# auto memory`, `# Memory` in older versions) and `# Session-specific guidance` are never sent, because they describe the session it was captured in (a memory directory under that project, that session's skills). A capture from a Claude Code version other than the installed one is still used, with a toast saying how to capture it again. OpenCode's own system blocks (agent prompt, AGENTS.md, instructions) follow, as OpenCode wrote them: the bridge no longer renames "OpenCode" in them.
-- **Prompt caching** — OpenCode's own `cache_control` markers are kept where OpenCode put them. The capture's markers are dropped. The API takes at most 4 breakpoints, a top-level `cache_control` (automatic caching) counting as one; past that, markers on tools go first (any later marker caches the tools too), then the earliest message markers, then the earliest system ones. The API also rejects a 5-minute marker ahead of a 1-hour one, which sorting the tools can produce, so such a 5-minute marker is dropped: the later 1-hour one already caches that prefix.
+- **Prompt caching** — OpenCode's own `cache_control` markers are kept where OpenCode put them. The capture's markers are dropped. The API takes at most 4 breakpoints, a top-level `cache_control` (automatic caching) and markers inside a tool result's content counting too; past that, markers on tools go first (any later marker caches the tools too), then the earliest message markers, then the earliest system ones. The API also rejects a 5-minute marker ahead of a 1-hour one, which sorting the tools can produce, so such a 5-minute marker is dropped: the later 1-hour one already caches that prefix.
 - **Custom and MCP tools** — sent under the names OpenCode gives them, with OpenCode's own description and schema, after Claude Code's core tools. No prefix is added and their names are not translated in either direction: only OpenCode's built-in tools with a Claude Code counterpart are renamed (`bash` -> `Bash`), so a tool merely named like one, such as `mcp_bash`, keeps its name.
 
 ### Tools
@@ -212,7 +212,7 @@ Each of OpenCode's built-in tools that has a Claude Code counterpart goes out un
 
 ### Conversation repair
 
-The API rejects a conversation where a tool call isn't answered by a result in the next turn, a result has no call in the turn before it, or results come after other content in a turn. A turn is every consecutive message from one role: the API merges them, so the bridge matches calls and results per turn too, and a user turn it repairs is sent as one message. Context compaction can leave one, and every later request in that session then fails. The bridge repairs only those: a missing result becomes an error result saying the bridge added it because no result is in the conversation; a result without its call becomes text that says so, with its content kept; results move to the front of their message. Assistant messages, including thinking blocks and their signatures, are never changed. A valid conversation is sent untouched, and each repair is logged.
+The API rejects a conversation where a tool call isn't answered by a result in the next turn, a result has no call in the turn before it, or results come after other content in a turn. A turn is every consecutive message from one role: the API merges them, so the bridge matches calls and results per turn too, and a user turn it repairs is sent as one message. Context compaction can leave one, and every later request in that session then fails. The bridge repairs only those: a missing result becomes an error result saying the bridge added it because no result is in the conversation; a result without its call, or a second result for a call already answered in that turn, becomes text that says so, with its content kept; results move to the front of their message. Assistant messages, including thinking blocks and their signatures, are never changed. A valid conversation is sent untouched, and each repair is logged.
 
 A conversation that ends on an assistant message gets a user turn of `Continue.`, since the endpoint requires one. OpenCode's content-free `Continue with your tasks.` nudge is dropped instead. An assistant tail meant as a prefill is therefore answered afresh rather than continued.
 
@@ -386,7 +386,12 @@ window `representative-claim` reports as binding. When the unified status
 rejects the account, the cooldown runs until that window resets even if
 `retry-after` is shorter; a longer `retry-after` still wins. When no reset can be
 determined the account is cooled rather than retried, because retrying a truly
-exhausted account is worse than briefly parking a healthy one.
+exhausted account is worse than briefly parking a healthy one. A cooldown already
+in force is never shortened: a request sent before it can come back with a plain
+`retry-after` of a minute or two for an account whose window is spent for hours.
+Without headers, a reset is read from the error message: a time it gives, if
+still ahead, or a duration ("in 5 minutes"); a long number counts as a reset
+time only where the message calls it one, since request ids are numbers too.
 
 Rotation only occurs **before** the response body is read. Once SSE streaming
 has begun a second stream cannot be spliced into the first, so mid-stream
@@ -421,7 +426,9 @@ is provably gone (same host: the PID no longer exists; other host: older than
 
 A refresh the token endpoint rejects disables the account. A network error or
 5xx cools it down for 60 seconds instead, so a brief outage can't disable every
-account in turn.
+account in turn. An account whose stored login is replaced while it is being
+refreshed (by a writer that doesn't take the lock) keeps the replacement; if that
+one has expired, it is refreshed in turn rather than handed out to earn a 401.
 
 The practical consequence: **after the pool refreshes an account, the Claude
 CLI's own stored copy of that credential is stale.** That is expected. Run
@@ -433,22 +440,24 @@ These are deliberate choices, not guarantees:
 
 - **Corrupt rotation state** is moved aside (`rotation-state.json.corrupt-<time>`) and the pool starts from defaults, so accounts that were disabled or cooling are tried again. A dead login fails its refresh again and is disabled again; an exhausted one gets a 429 and cools until its real reset. The cost is a few failed attempts, and no token is lost: the state file holds no credentials.
 - **A lost token response can't be recovered.** If the network drops after Anthropic has rotated a refresh token but before its reply arrives, the old token is spent and the new one never reached this machine. Journals cover everything after the reply arrives, not that gap; that login needs a new sign-in.
-- **A save the journal couldn't cover** — the journal write itself fails — still saves the tokens, logging the failure, since skipping the save would drop the only valid ones. A journal that can't be moved aside stops further refreshes of that login rather than overwrite it.
+- **A save the journal couldn't cover** — the journal write itself fails — still saves the tokens, logging the failure, since skipping the save would drop the only valid ones. If that save fails too, the next request saves them once storage works. Until then another OpenCode process finds only the spent token, and if it refreshes it Anthropic refuses it once; it doesn't send it again, and the login is saved properly at this process's next request. A journal that can't be moved aside stops further refreshes of that login rather than overwrite it.
 - **A journal that can't be read** (damaged, or not a file) also stops refreshes of OpenCode's own login, with a message naming it: it may hold the login's only valid token, and refreshing without it would resend a spent one. Repair it or move it aside.
 - **The record of which login is OpenCode's own** is written after every refresh. If that write fails, the journal is kept in its place until it succeeds, so the login is still refreshed as OpenCode's own and never replaced by Claude Code's. If neither can be written, only the running process knows: after a restart the login is taken for a Claude Code copy, and Claude Code's login replaces it if there is one.
-- **Writes are read-compare-write, not atomic swaps.** Every writer in this package takes the rotation lock, and a refresh re-reads the stored login before saving: one replaced meanwhile (another `opencode auth login`, a hand edit) is kept and the refresh's tokens are set aside in a `.stale` file. The request goes out with the new login instead, or, if that one has expired, gets a 503 that OpenCode retries with it; never with the login it replaced. A writer that doesn't take the lock can still land in the instant between that check and the save.
-- **The lock is a local-machine lock.** On one host a stale lock is reclaimed only once its holder's process is gone. On a shared or network filesystem a holder on another host can't be checked, so its lock is reclaimed by age (3 minutes); don't share the pool's directory between machines that refresh at the same time. The lock does not coordinate an unmodified Claude Code, which is why its login is never refreshed here.
+- **Writes are read-compare-write, not atomic swaps.** Every writer in this package takes the rotation lock, and a refresh re-reads the stored login before saving: one replaced meanwhile (another `opencode auth login`, a hand edit) is kept and the refresh's tokens are set aside in a `.stale` file, written from the tokens themselves if their journal couldn't be. The request goes out with the new login instead, or, if that one has expired, gets a 503 that OpenCode retries with it; never with the login it replaced. A writer that doesn't take the lock can still land in the instant between that check and the save.
+- **The lock is a local-machine lock.** On one host a stale lock is reclaimed only once its holder's process is gone: its pid no longer runs, or now runs a process that started at another time, since pids are reused, after a reboot most of all. A stale lock that can't be reclaimed (a permissions or disk error) is reported as that error, not waited out as if another process held it. On a shared or network filesystem a holder on another host can't be checked, so its lock is reclaimed by age (3 minutes); don't share the pool's directory between machines that refresh at the same time. The lock does not coordinate an unmodified Claude Code, which is why its login is never refreshed here.
 - **Releasing the lock** removes it only if it still holds this process's id, so a lock reclaimed and taken over by another process is never removed by the old holder.
 
 ### Trusted destinations
 
-The bridge sends your subscription login only to `https://api.anthropic.com`. A provider `baseURL` pointing elsewhere (a proxy, a gateway) gets a 400 naming the setting instead, and nothing is sent. To allow one you trust, list its origin:
+The bridge sends your subscription login only to `https://api.anthropic.com`. A provider `baseURL` pointing elsewhere (a proxy, a gateway) gets a 400 naming the setting instead, and nothing is sent. The bridge's own requests with the login (the account profile and usage lookups, `ANTHROPIC_PROFILE_URL` and `ANTHROPIC_USAGE_URL`) follow the same rule. To allow one you trust, list its origin:
 
 ```bash
 export ANTHROPIC_TRUSTED_ORIGINS="https://llm-proxy.internal.example"   # comma- or space-separated
 ```
 
-Requests that carry the login never follow redirects: a redirect is handed back to OpenCode as the response, so it can't carry the login to another host. API-key requests are sent by OpenCode itself and are unaffected.
+Only http and https entries count: a `file:` or `data:` URL has no origin of its own, so it is ignored with a warning.
+
+Requests that carry the login never follow redirects: a redirect is handed back to OpenCode as the response (or, for the profile and usage lookups, treated as a failure), so it can't carry the login to another host. API-key requests are sent by OpenCode itself and are unaffected.
 
 ### Request trace
 
@@ -505,9 +514,9 @@ reports its results by kind of evidence, with what it leaves out:
 
 | Class | What it is | How to run | Last run (13 Nov 2026) |
 |---|---|---|---|
-| fixture | in-process unit tests on fixed inputs | `npm test` | 319/319 |
-| injected-boundary | fake servers, stubbed `security`, fault injection at one boundary | `npm test` | 306/306 |
-| process | real child processes racing on real lock, journal and store files, and `verify:build` in a scratch checkout | `npm test` | 91/91 |
+| fixture | in-process unit tests on fixed inputs | `npm test` | 326/326 |
+| injected-boundary | fake servers, stubbed `security`, fault injection at one boundary | `npm test` | 317/317 |
+| process | real child processes racing on real lock, journal and store files, and `verify:build` in a scratch checkout | `npm test` | 95/95 |
 | native | the pool's macOS Keychain backend against a temporary keychain it creates and deletes | `npm run test:native` | 2/2 |
 | real host | OpenCode 1.18.30 + OhMyOpenCode 4.19.4 against a fake API, API key vs OAuth: skills, commands, grep, bash, read, MCP, category/subagent/background/continuation tasks, invalid input | `node scripts/qa-opencode1.mjs` | 36/36 |
 | real host, OpenCode 2 | the V2 entry under a real OpenCode 2 | `node scripts/qa-opencode2.mjs --bin …` | **not run**: no OpenCode 2.x build was available from npm |
@@ -567,7 +576,7 @@ To check the OpenCode 1 plugin end to end without touching your accounts:
 npm run build && node scripts/qa-opencode1.mjs
 ```
 
-It runs the real `opencode` (1.x) with this build and, if installed, OhMyOpenCode against a local fake Anthropic API in a throwaway environment (its own HOME, config, pool and a stand-in for the macOS `security` tool), after checking that the plugin can see only fake credentials. The same scripted workload runs twice — on a stored API key, which the bridge passes through, and on the OAuth path — and drives skill, grep, bash, read, a subagent and a continuation of it through OpenCode's own tools. It reports PASS/FAIL for each, checks that the OAuth tools carry the host's own schemas and fields, and writes the requests both runs sent, parent and subagent separately, to a JSON report (`--out`).
+It runs the real `opencode` (1.x) with this build and the OhMyOpenCode build your OpenCode config loads (or the one `--omo <file-url>` names; `--no-omo` for none) against a local fake Anthropic API in a throwaway environment (its own HOME, config, pool and a stand-in for the macOS `security` tool), after checking that the plugin can see only fake credentials. The same scripted workload runs twice — on a stored API key, which the bridge passes through, and on the OAuth path — and drives skill, grep, bash, read, a subagent and a continuation of it through OpenCode's own tools. It reports PASS/FAIL for each, checks that the OAuth tools carry the host's own schemas and fields, and writes the requests both runs sent, parent and subagent separately, to a JSON report (`--out`).
 
 To check the OpenCode 2 plugin end to end without touching your accounts:
 

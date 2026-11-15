@@ -86,6 +86,17 @@ describe("repairToolPairs", () => {
     assert.deepEqual(repaired.messages[0].content, [text("before"), text("The bridge converted this tool result because its matching call is not in the preceding assistant message.\noutput"), text("after")]);
   });
 
+  it("keeps one result per call, turning a repeated one into disclosed text, also across a split turn", () => {
+    const repaired = repairToolPairs([assistant(use("a"), use("b")), user(result("a", "first")), user(result("b"), result("a", "again"))]);
+    assert.deepEqual(repaired.repairs.convertedResults, ["a"]);
+    assert.deepEqual(repaired.messages[1].content, [
+      result("a", "first"),
+      result("b"),
+      text("The bridge converted this tool result because its call already has a result earlier in this turn.\nagain"),
+    ]);
+    assert.strictEqual(repairToolPairs(repaired.messages).messages, repaired.messages);
+  });
+
   it("preserves text and image blocks from an orphan array result", () => {
     const image = { type: "image", source: { type: "base64", data: "AA==" } };
     const repaired = repairToolPairs([user(result("orphan", [text("output"), image]))]);

@@ -99,6 +99,8 @@ export type AcquireResult =
 
 /** Cooldown applied when a refresh fails for a reason that may resolve itself. */
 export const TRANSIENT_REFRESH_COOLDOWN_MS = 60_000;
+/** Logins refreshed in one locked pass when each is replaced while it is refreshed. */
+const MAX_REPLACED_ROUNDS = 2;
 
 class JournalQuarantineError extends Error {}
 
@@ -196,20 +198,24 @@ export function createRotationManager(opts: ManagerOptions) {
   // ── Journal ───────────────────────────────────────────────────────
 
   function writeJournal(entry: JournalEntry): void {
-    const dir = path.dirname(journalPath);
+    writeEntry(journalPath, entry);
+  }
+
+  function writeEntry(file: string, entry: JournalEntry): void {
+    const dir = path.dirname(file);
     const created = fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     if (created) fs.chmodSync(dir, 0o700);
 
-    const tmp = `${journalPath}.${randomUUID()}.tmp`;
+    const tmp = `${file}.${randomUUID()}.tmp`;
     const fd = fs.openSync(tmp, "wx", 0o600);
     try {
       try {
-        fs.writeSync(fd, JSON.stringify(entry));
+        fs.writeFileSync(fd, JSON.stringify(entry));
         fs.fsyncSync(fd);
       } finally {
         fs.closeSync(fd);
       }
-      fs.renameSync(tmp, journalPath);
+      fs.renameSync(tmp, file);
     } catch (err) {
       try { fs.rmSync(tmp, { force: true }); } catch { /* best effort */ }
       throw err;
@@ -247,6 +253,22 @@ export function createRotationManager(opts: ManagerOptions) {
         log("error", detail);
       }
       throw new JournalQuarantineError(reason);
+    }
+  }
+
+  /** Out of the replay path but kept: they may be the only live tokens of the login they came from. */
+  function setAsideTokens(entry: JournalEntry, reason: string): void {
+    if (readJournal()?.tokens.refresh === entry.tokens.refresh) {
+      setAsideJournal(entry.label, reason);
+      return;
+    }
+    // The journal write failed, so nothing on disk holds them yet.
+    const aside = `${journalPath}.${randomUUID()}.stale`;
+    try {
+      writeEntry(aside, entry);
+      log("warn", `[claude-pool] set aside refreshed tokens for "${entry.label}" (${reason}): ${aside}`);
+    } catch (err) {
+      log("error", `[claude-pool] could not set aside refreshed tokens for "${entry.label}" (${reason}); they are lost: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
@@ -348,36 +370,42 @@ export function createRotationManager(opts: ManagerOptions) {
         await commitPendingJournalLocked();
         // Another process may have refreshed while we waited for the lock.
         // Re-read inside the critical section before burning our token.
-        const current = await accounts.getAccount(label);
-        if (!current) throw new Error(`Account "${label}" is not enrolled`);
-        if (isFresh(current.oauth, clock()) && current.oauth.access !== rejectedAccess) return current.oauth;
+        let current = await accounts.getAccount(label);
+        for (let round = 0; ; round++) {
+          if (!current) throw new Error(`Account "${label}" is not enrolled`);
+          if (isFresh(current.oauth, clock()) && current.oauth.access !== rejectedAccess) return current.oauth;
+          if (round === MAX_REPLACED_ROUNDS) throw new Error(`Account "${label}" kept being replaced while it was refreshed`);
 
-        const fresh = await refreshFn(current.oauth.refresh);
+          const fresh = await refreshFn(current.oauth.refresh);
+          const entry: JournalEntry = { label, tokens: fresh, writtenAt: clock(), replaces: current.oauth.refresh };
 
-        // Journal BEFORE committing: the server has already invalidated the
-        // old refresh token, so these are now the only usable credentials.
-        try {
-          writeJournal({ label, tokens: fresh, writtenAt: clock(), replaces: current.oauth.refresh });
-        } catch (err) {
-          // Commit anyway: skipping the store write would drop the only valid tokens.
-          log("warn",
-            `[claude-pool] failed to journal refresh for "${label}": ${
-              err instanceof Error ? err.message : String(err)
-            }`,
-          );
+          // Journal BEFORE committing: the server has already invalidated the
+          // old refresh token, so these are now the only usable credentials.
+          try {
+            writeJournal(entry);
+          } catch (err) {
+            // Commit anyway: skipping the store write would drop the only valid tokens.
+            log("warn",
+              `[claude-pool] failed to journal refresh for "${label}": ${
+                err instanceof Error ? err.message : String(err)
+              }`,
+            );
+          }
+          // Read-compare-write, not an atomic swap: every writer in this package
+          // holds the lock, but one that doesn't (a hand edit, an old version)
+          // could still land after this check. Its login is kept, ours set aside.
+          const latest = await accounts.getAccount(label);
+          if (latest && latest.oauth.refresh !== current.oauth.refresh) {
+            setAsideTokens(entry, "account replaced during the refresh");
+            // An expired replacement would only earn a 401: refresh it in turn.
+            current = latest;
+            continue;
+          }
+          await accounts.updateTokens(label, fresh);
+          clearJournal();
+
+          return fresh;
         }
-        // Read-compare-write, not an atomic swap: every writer in this package
-        // holds the lock, but one that doesn't (a hand edit, an old version)
-        // could still land after this check. Its login is kept, ours set aside.
-        const latest = await accounts.getAccount(label);
-        if (latest && latest.oauth.refresh !== current.oauth.refresh) {
-          setAsideJournal(label, "account replaced during the refresh");
-          return latest.oauth;
-        }
-        await accounts.updateTokens(label, fresh);
-        clearJournal();
-
-        return fresh;
       });
     })();
 

@@ -10,6 +10,8 @@
  * you are already being throttled — too late to be useful as a gauge.
  */
 
+import { mayCarryLogin } from "../request-policy.js";
+
 export const USAGE_URL =
   process.env.ANTHROPIC_USAGE_URL ?? "https://api.anthropic.com/api/oauth/usage";
 
@@ -85,10 +87,12 @@ export async function fetchUsage(
   const now = opts.now ?? (() => Date.now());
   const doFetch = opts.fetchImpl ?? fetch;
 
+  if (!mayCarryLogin(url)) throw new Error(`usage request not sent: ${url} isn't an Anthropic origin or listed in ANTHROPIC_TRUSTED_ORIGINS`);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), USAGE_TIMEOUT_MS);
   try {
     const response = await doFetch(url, {
+      redirect: "manual",
       headers: {
         authorization: `Bearer ${accessToken}`,
         "anthropic-beta": "oauth-2025-04-20",
